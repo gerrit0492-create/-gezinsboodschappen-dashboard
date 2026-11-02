@@ -115,7 +115,7 @@ token_key = hashlib.sha256(token.encode("utf-8")).hexdigest()
 user_key = text(user.get("email")).casefold()
 
 
-@st.cache_resource(max_entries=20, show_spinner=False)
+@st.cache_resource(ttl=3600, max_entries=20, show_spinner=False)   # tokens live ~1h; don't keep them longer
 def _open_sheet(token_key, _token, _sheet_id):
     return connect(_token, _sheet_id)
 

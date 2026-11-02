@@ -15,7 +15,7 @@ Deze repository bevat **alleen applicatiecode**. Alle gegevens (voorraad, prijze
   (`st.user.tokens["access"]`, scope `https://www.googleapis.com/auth/spreadsheets`). Er is geen serviceaccount en
   geen sleutelbestand. Elke toegestane gebruiker moet de Sheet zelf mogen bewerken (Delen → Bewerker).
 - Het token wordt alleen server-side gebruikt, nooit getoond of gelogd; gegevens worden per gebruiker en per token
-  gecachet, nooit gedeeld tussen sessies. Alle geheimen staan uitsluitend in de Streamlit-secrets van de host.
+  gecachet, nooit gedeeld tussen gebruikers. Uitloggen trekt het token ook bij Google in. Alle geheimen staan uitsluitend in de Streamlit-secrets van de host.
 - **Sessieduur**: Streamlit bewaart het toegangstoken bij het inloggen en vernieuwt het niet. Google-toegangstokens
   verlopen na ongeveer een uur; daarna meldt de app "sessie verlopen" en log je opnieuw in. Er worden geen
   refresh-tokens gebruikt, dus de 7-dagenlimiet van refresh-tokens in Google's OAuth-testmodus speelt niet.

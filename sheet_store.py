@@ -68,7 +68,8 @@ def classify_error(exc):
     if status == 401:
         return "expired"
     if status == 403 or isinstance(exc, PermissionError):
-        return "scope" if "scope" in str(exc).lower() else "forbidden"
+        detail = f"{exc} {getattr(exc, '__cause__', '') or ''}".lower()   # gspread hides the 403 text in __cause__
+        return "scope" if "scope" in detail else "forbidden"
     if status == 404:
         return "not_found"
     if status == 429:

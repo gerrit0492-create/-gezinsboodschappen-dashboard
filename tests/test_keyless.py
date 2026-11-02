@@ -299,3 +299,42 @@ def test_auth_negatives_never_touch_the_token_or_sheet(monkeypatch, user, allow)
     used = []
     at, calls = start(monkeypatch, make_book(), user=user, allow=allow, token=lambda: used.append(1) or "tok")
     assert calls == [] and used == [] and shows_no_data(at)          # token not even read before access
+
+
+# --- review hardening ----------------------------------------------------------------------------------
+
+def test_missing_scope_is_recognised_even_when_opening_the_sheet():
+    fake = FakeGoogle(google_error(403, "Request had insufficient authentication scopes.", "PERMISSION_DENIED"))
+    with pytest.raises(PermissionError) as info:
+        open_with(fake)
+    assert classify_error(info.value) == "scope"
+
+
+def test_revoke_posts_token_in_body_to_google_and_never_fails():
+    calls = []
+
+    def post(url, data, timeout):
+        calls.append((url, data, timeout))
+        return 200
+    assert auth.revoke("tok-123", post=post) is True
+    assert calls == [("https://oauth2.googleapis.com/revoke", {"token": "tok-123"}, 5)]   # token not in the URL
+
+    def down(url, data, timeout):
+        raise OSError("network down")
+    assert auth.revoke("tok-123", post=down) is False                  # logout still continues
+    assert auth.revoke(None, post=post) is False and len(calls) == 1   # nothing sent without a token
+
+
+def test_logout_revokes_before_clearing_the_session(monkeypatch):
+    import streamlit as st
+    order = []
+    monkeypatch.setattr(auth, "access_token", lambda: "tok-x")
+    monkeypatch.setattr(auth, "revoke", lambda token: order.append(("revoke", token)))
+    monkeypatch.setattr(st, "logout", lambda: order.append(("logout", None)))
+    auth.logout()
+    assert order == [("revoke", "tok-x"), ("logout", None)]
+
+
+def test_cached_sheet_connections_expire_with_the_token():
+    src = (ROOT / "app.py").read_text()
+    assert "@st.cache_resource(ttl=3600" in src

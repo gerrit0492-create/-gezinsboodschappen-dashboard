@@ -56,5 +56,29 @@ def login():
     st.login()
 
 
+REVOKE_URL = "https://oauth2.googleapis.com/revoke"
+
+
+def revoke(token, post=None, timeout=5):
+    """Best effort: tell Google to invalidate the access token (token in the POST body, never in a URL)."""
+    if not token:
+        return False
+    try:
+        if post is None:
+            import urllib.parse
+            import urllib.request
+
+            def post(url, data, timeout):
+                body = urllib.parse.urlencode(data).encode("ascii")
+                request = urllib.request.Request(url, data=body, method="POST", headers={
+                    "Content-Type": "application/x-www-form-urlencoded"})
+                with urllib.request.urlopen(request, timeout=timeout) as response:
+                    return response.status
+        return post(REVOKE_URL, {"token": token}, timeout) == 200
+    except Exception:
+        return False                      # logout must never fail because Google is unreachable
+
+
 def logout():
+    revoke(access_token())                # a copied token stops working now, not after ~1 hour
     st.logout()
