@@ -42,6 +42,8 @@ if not user.get("is_logged_in"):
     st.title("🛒 Gezinsboodschappen")
     if not auth.login_configured():
         st.error("Inloggen is nog niet ingericht ([auth] in de app-secrets). Er wordt geen data getoond.")
+        for problem in auth.login_problems():         # names only, never secret values
+            st.caption(f"• {problem}")
         st.stop()
     st.write("Log in met je Google-account. Alleen vooraf toegestane gezinsaccounts krijgen toegang.")
     st.button("Inloggen met Google", type="primary", width="stretch", on_click=auth.login)

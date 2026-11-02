@@ -38,21 +38,35 @@ def requested_scopes():
         return []
 
 
-def login_configured():
-    """[auth] present with a real cookie secret, the access token exposed and EXACTLY the scopes
-    openid, email, profile and drive.file (any other scope is treated as a configuration error)."""
+def login_problems():
+    """Names (never values) of what is missing or wrong in the [auth] secrets; empty list = configured."""
     try:
         auth = st.secrets.get("auth")
         if not auth:
-            return False
+            return ["[auth]-blok ontbreekt"]
+        problems = []
+        for key in ("redirect_uri", "client_id"):
+            if not auth.get(key):
+                problems.append(f"{key} ontbreekt")
         secret = str(auth.get("cookie_secret") or "")
+        if len(secret) < 32 or secret == EXAMPLE_COOKIE_SECRET:
+            problems.append("cookie_secret ontbreekt, is korter dan 32 tekens of is het voorbeeld")
         exposed = auth.get("expose_tokens") or []
         exposed = [exposed] if isinstance(exposed, str) else [str(x) for x in exposed]
-        scope = set(requested_scopes())
-        return bool(auth.get("redirect_uri") and auth.get("client_id") and len(secret) >= 32
-                    and secret != EXAMPLE_COOKIE_SECRET and "access" in exposed and scope == ALLOWED_SCOPES)
+        if "access" not in exposed:
+            problems.append('expose_tokens = "access" ontbreekt')
+        if set(requested_scopes()) != ALLOWED_SCOPES:
+            problems.append('client_kwargs scope moet exact "openid email profile '
+                            'https://www.googleapis.com/auth/drive.file" zijn')
+        return problems
     except Exception:
-        return False
+        return ["secrets konden niet gelezen worden"]
+
+
+def login_configured():
+    """[auth] present with a real cookie secret, the access token exposed and EXACTLY the scopes
+    openid, email, profile and drive.file (any other scope is treated as a configuration error)."""
+    return not login_problems()
 
 
 def picker_config():

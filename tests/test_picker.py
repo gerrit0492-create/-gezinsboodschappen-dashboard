@@ -232,3 +232,35 @@ def test_project_number_is_derived_from_the_oauth_client_id(monkeypatch):
     for secrets, expected in cases:
         monkeypatch.setattr(st, "secrets", Secrets(**secrets))
         assert auth.picker_config() == expected
+
+
+def test_login_problems_name_what_is_missing_without_values(monkeypatch):
+    import streamlit as st
+    good = {"redirect_uri": "https://x.streamlit.app/oauth2callback", "client_id": "123-a.apps.googleusercontent.com",
+            "cookie_secret": "s3cr3t-" + "y" * 40, "expose_tokens": "access",
+            "client_kwargs": {"scope": "openid email profile https://www.googleapis.com/auth/drive.file"}}
+    monkeypatch.setattr(st, "secrets", Secrets(auth=good))
+    assert auth.login_problems() == [] and auth.login_configured() is True
+    bad = dict(good, cookie_secret="short", expose_tokens="id",
+               client_kwargs={"scope": "openid email profile https://www.googleapis.com/auth/spreadsheets"})
+    monkeypatch.setattr(st, "secrets", Secrets(auth=bad))
+    problems = auth.login_problems()
+    assert len(problems) == 3 and auth.login_configured() is False
+    assert not any("short" in p or "spreadsheets\"" in p or "123-a" in p for p in problems)   # never echoes values
+    monkeypatch.setattr(st, "secrets", Secrets())
+    assert auth.login_problems() == ["[auth]-blok ontbreekt"]
+
+
+def test_not_configured_page_lists_problems_and_reads_nothing(monkeypatch):
+    calls = []
+    monkeypatch.setattr(sheet_store, "connect", lambda *a: calls.append(a))
+    monkeypatch.setattr(auth, "current_user", lambda: {"is_logged_in": False})
+    from streamlit.testing.v1 import AppTest
+    at = AppTest.from_file(str(ROOT / "app.py"), default_timeout=30)
+    at.secrets["auth"] = {"redirect_uri": "https://x.streamlit.app/oauth2callback", "client_id": "1-a",
+                          "cookie_secret": "z" * 40,
+                          "client_kwargs": {"scope": "openid email profile https://www.googleapis.com/auth/drive.file"}}
+    at.run()
+    assert any("niet ingericht" in e.value for e in at.error)
+    assert any("expose_tokens" in c.value for c in at.caption) and calls == [] and not at.tabs
+    assert not any("z" * 40 in c.value for c in at.caption)
