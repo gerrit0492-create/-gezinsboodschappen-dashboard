@@ -11,17 +11,22 @@ Deze repository bevat **alleen applicatiecode**. Alle gegevens (voorraad, prijze
   zonder toegang wordt de Google Sheet niet eens geopend. Er is geen gedeeld wachtwoord.
 - Vóór het inloggen toont de app alleen de titel en een inlogknop. Foutmeldingen tonen geen inhoud, alleen het
   type fout. De gedeelde cache met Sheet-data wordt pas na de toegangscontrole aangesproken.
-- **Sleutelloze Sheet-toegang**: de app gebruikt het eigen Google-toegangstoken van de ingelogde gebruiker
-  (`st.user.tokens["access"]`, scope `https://www.googleapis.com/auth/spreadsheets`). Er is geen serviceaccount en
-  geen sleutelbestand. Elke toegestane gebruiker moet de Sheet zelf mogen bewerken (Delen → Bewerker).
-- Het token wordt alleen server-side gebruikt, nooit getoond of gelogd; gegevens worden per gebruiker en per token
-  gecachet, nooit gedeeld tussen gebruikers. Uitloggen trekt het token ook bij Google in. Alle geheimen staan uitsluitend in de Streamlit-secrets van de host.
-- **Sessieduur**: Streamlit bewaart het toegangstoken bij het inloggen en vernieuwt het niet. Google-toegangstokens
-  verlopen na ongeveer een uur; daarna meldt de app "sessie verlopen" en log je opnieuw in. Er worden geen
-  refresh-tokens gebruikt, dus de 7-dagenlimiet van refresh-tokens in Google's OAuth-testmodus speelt niet.
-- De scope `spreadsheets` geeft technisch toegang tot alle spreadsheets van de gebruiker; de app opent alleen
-  `SHEET_ID`. Een smallere scope (`drive.file`) werkt alleen voor bestanden die via de app zijn gemaakt of gekozen
-  en is daarom niet bruikbaar voor een bestaande Sheet zonder extra bestandskiezer.
+- **Sleutelloze, beperkte Sheet-toegang**: de app gebruikt het eigen Google-toegangstoken van de ingelogde gebruiker
+  (`st.user.tokens["access"]`) met **alleen** de scope `https://www.googleapis.com/auth/drive.file`. Daarmee kan de app
+  uitsluitend bestanden gebruiken die de gebruiker er zelf voor kiest. Elke toegestane gebruiker kiest de voorraad-Sheet
+  **eenmalig** in Google Picker; Google onthoudt die keuze per gebruiker. Brede scopes (`spreadsheets`, `drive`) worden
+  door de app geweigerd. Er is geen serviceaccount en geen sleutelbestand.
+- De app gebruikt nooit het bestand dat de Picker teruggeeft: het opent alleen `SHEET_ID` uit de secrets en vergelijkt
+  de keuze daarmee. Een verkeerde of gemanipuleerde keuze geeft geen toegang. Elke gebruiker moet de Sheet ook zelf
+  mogen bewerken (Delen → Bewerker).
+- Het token wordt alleen server-side en voor de Picker in het geheugen van de browser gebruikt; deze app schrijft het
+  nooit naar localStorage, sessionStorage, cookies, de URL of logs. Streamlit zelf bewaart het bij het inloggen in zijn
+  ondertekende, HttpOnly login-cookie (niet leesbaar voor JavaScript). Gegevens worden per gebruiker en per token
+  gecachet en nooit gedeeld tussen gebruikers.
+- **Sessieduur**: Google-toegangstokens verlopen na ongeveer een uur; daarna meldt de app "sessie verlopen" en log je
+  opnieuw in (de bestandskeuze blijft bewaard). Er worden geen refresh-tokens gebruikt, dus de 7-dagenlimiet van
+  Google's OAuth-testmodus speelt niet. Uitloggen trekt het token bewust niet in bij Google: dat zou ook de
+  bestandskeuze wissen.
 - De app plaatst nooit zelf een bestelling, verstuurt geen e-mail en doet geen betaalde AI-calls.
 
 ## Functies
@@ -75,20 +80,20 @@ Beperking: dit is controleren-dan-schrijven, geen atomische compare-and-swap.
 
 ## Installeren op Streamlit Community Cloud (publieke app, afgeschermde inhoud)
 
-1. Google Cloud-project: schakel de **Google Sheets API** in. Er is **geen serviceaccount of sleutel** nodig.
-2. **Google Auth Platform → Branding/Audience**: type *External*, publicatiestatus *Testing*, en voeg de toegestane
-   accounts toe als **testgebruikers**. Onder **Data Access** de scope
-   `https://www.googleapis.com/auth/spreadsheets` toevoegen. Omdat dit een gevoelige scope is en de app niet door
-   Google geverifieerd is, toont Google bij het inloggen een waarschuwing "app niet geverifieerd"; testgebruikers
-   kunnen via *Geavanceerd → Doorgaan* verder.
-3. **Clients → Create client → Web application** met redirect-URI `https://<app-naam>.streamlit.app/oauth2callback`.
-4. Deel de Google Sheet met elk toegestaan account als **Bewerker**.
-5. https://share.streamlit.io → *Create app* → deze repository, branch `main`, bestand `app.py`.
-6. *App settings → Secrets*: vul `.streamlit/secrets.toml.example` in (`ALLOWED_EMAILS`, `SHEET_ID`, `[auth]` met
-   eigen `cookie_secret`, `client_id`, `client_secret`, `expose_tokens` en `client_kwargs`).
-7. Test: inloggen met een toegestaan én een niet-toegestaan account; bij inloggen toegang tot Spreadsheets
-   toestaan; één telling opslaan en in de Sheet terugzien; app herstarten en opnieuw controleren; na ruim een uur
-   controleren dat "sessie verlopen" verschijnt en opnieuw inloggen werkt.
+1. Google Cloud-project: schakel de **Google Sheets API** en de **Google Picker API** in. Geen serviceaccount nodig.
+2. **Google Auth Platform**: Audience *External*, status *Testing*, toegestane accounts als **testgebruikers**.
+   Onder **Data Access** alleen de scope `https://www.googleapis.com/auth/drive.file` (niet-gevoelig; geen
+   "app niet geverifieerd"-melding voor deze scope).
+3. **Clients → Create client → Web application** met redirect-URI `https://<app-naam>.streamlit.app/oauth2callback`
+   en als *Authorized JavaScript origin* `https://<app-naam>.streamlit.app`.
+4. **APIs & Services → Credentials → Create credentials → API key**: beperk tot de *Google Picker API* en tot
+   websites `https://<app-naam>.streamlit.app/*`. Noteer ook het **projectnummer** (Dashboard / Projectinfo).
+5. Deel de Google Sheet met elk toegestaan account als **Bewerker**.
+6. https://share.streamlit.io → *Create app* → deze repository, bestand `app.py`.
+7. *App settings → Secrets*: vul `.streamlit/secrets.toml.example` in (`ALLOWED_EMAILS`, `SHEET_ID`, `[auth]` met
+   `expose_tokens` en `client_kwargs`, `[picker]` met `api_key` en `app_id` = projectnummer).
+8. Test: inloggen, eenmalig het voorraadbestand kiezen, één telling opslaan en in de Sheet terugzien, herstarten,
+   opnieuw inloggen zonder opnieuw te hoeven kiezen, en een niet-toegestaan account weigeren.
 
 ## Lokaal ontwikkelen
 

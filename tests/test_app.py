@@ -129,7 +129,8 @@ def fresh_caches(monkeypatch):
     yield
 
 
-def start(monkeypatch, book, user=ALLOWED, configured=True, allow=("ouder@example.com",), token="tok-ouder"):
+def start(monkeypatch, book, user=ALLOWED, configured=True, allow=("ouder@example.com",), token="tok-ouder",
+          secrets=None):
     calls = []
 
     def connect(access_token, sid):
@@ -142,6 +143,8 @@ def start(monkeypatch, book, user=ALLOWED, configured=True, allow=("ouder@exampl
     at = AppTest.from_file(APP, default_timeout=30)
     at.secrets["ALLOWED_EMAILS"] = list(allow)
     at.secrets["SHEET_ID"] = "fake"
+    for k, v in (secrets or {}).items():
+        at.secrets[k] = v
     at.run()
     assert not at.exception, at.exception
     return at, calls

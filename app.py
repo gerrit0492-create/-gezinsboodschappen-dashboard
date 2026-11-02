@@ -1,7 +1,8 @@
 """Gezinsboodschappen — mobile-first Streamlit dashboard over the private Google Sheet.
 
 Access: Google login (OIDC) + explicit e-mail allowlist, checked before any Sheet data is read.
-Sheet access is keyless: the logged-in user's own Google access token (spreadsheets scope) is used.
+Sheet access is keyless and least-privilege: the logged-in user's own Google access token with only the
+drive.file scope; each user picks the configured stock Sheet once in Google Picker.
 """
 from __future__ import annotations
 
@@ -13,6 +14,7 @@ import streamlit as st
 
 import auth
 import scan
+from picker import check_pick, picker_step
 from core import (CHECK_WINDOW_DAYS, DELIVERY_KEYS, MAX_BUDGET, PRICE_NORMAL, PRICE_OFFER, classify_inventory,
                   compare_suppliers, confirmations, delivery_check, effective_budget, expiring, go_decision,
                   is_active, is_allowed, latest_price, low_stock, match_barcodes, new_receipt_rows, normalised_price,
@@ -73,10 +75,10 @@ def saved(message):
 ACCESS_MESSAGES = {
     "expired": "Je Google-sessie voor de Sheet is verlopen (dat gebeurt na ongeveer een uur). Log uit en log "
                "opnieuw in.",
-    "scope": "Bij het inloggen is geen toestemming voor Google Spreadsheets gegeven. Log uit, log opnieuw in en "
-             "sta toegang tot Google Spreadsheets toe.",
-    "forbidden": "Geen toegang tot de Sheet: sta bij het inloggen toegang tot Google Spreadsheets toe, en zorg dat "
-                 "dit Google-account de Sheet mag bewerken (Delen → Bewerker).",
+    "scope": "Bij het inloggen is geen toestemming gegeven voor bestanden die je met deze app gebruikt. Log uit, "
+             "log opnieuw in en sta die toegang toe.",
+    "forbidden": "Geen toegang tot de Sheet: kies het voorraadbestand eenmalig in Google Drive, en zorg dat dit "
+                 "Google-account de Sheet mag bewerken (Delen → Bewerker).",
     "not_found": "De Sheet is niet gevonden: controleer SHEET_ID en of dit Google-account toegang heeft.",
     "rate_limited": "Google is even te druk (limiet bereikt). Probeer het over een minuut opnieuw.",
 }
@@ -105,8 +107,8 @@ if not sid:
     st.stop()
 token = auth.access_token()
 if not token:
-    st.error("Je sessie heeft geen toegang tot Google Spreadsheets. Log uit en log opnieuw in, en sta toegang tot "
-             "Google Spreadsheets toe.")
+    st.error("Je sessie heeft geen toegang tot Google Drive-bestanden. Log uit en log opnieuw in, en sta toegang "
+             "toe tot bestanden die je met deze app gebruikt.")
     st.button("Uitloggen en opnieuw inloggen", on_click=auth.logout, type="primary", width="stretch")
     st.stop()
 # Caches are keyed per user AND per token: a Sheet read with one person's token is never served to another
@@ -129,16 +131,48 @@ def snapshot(user_key, token_key):
     return read_all(spreadsheet())
 
 
+def pick_step():
+    """One-time Google Picker choice of the stock Sheet (drive.file). Only reached after login, verified e-mail,
+    allowlist and token checks; the picked ID is only compared with SHEET_ID, never used for access."""
+    st.subheader("Eenmalig: kies het voorraadbestand")
+    st.write("Deze app mag alleen bestanden gebruiken die jij er zelf voor kiest. Kies één keer de voorraad-Sheet "
+             "in Google Drive; Google onthoudt die keuze daarna voor jouw account.")
+    if st.session_state.get("pick_tried"):
+        st.warning("Na het kiezen is er nog geen toegang. Controleer of je het juiste bestand koos en of dit "
+                   "Google-account de Sheet mag bewerken (Delen → Bewerker).")
+    api_key, app_id = auth.picker_config()
+    if not api_key:
+        st.error("Bestandskeuze is niet ingericht: [picker] api_key en app_id ontbreken in de secrets.")
+        return
+    status, message = check_pick(picker_step(token, api_key, app_id, str(sid)), sid)
+    if status == "ok":
+        st.session_state["pick_tried"] = True
+        st.cache_data.clear()
+        st.cache_resource.clear()
+        st.rerun()
+    elif status:
+        st.warning(message)
+    st.caption("Zie je het bestand niet in de lijst? Dan heeft dit Google-account geen toegang tot de Sheet: laat de "
+               "eigenaar hem met je delen als Bewerker. Lukt kiezen op de iPhone niet, doe het dan eenmalig op een "
+               "computer; daarna werkt de app ook op de iPhone.")
+
+
 try:
     data = snapshot(user_key, token_key)
 except Exception as exc:
     kind = classify_error(exc)
+    if kind in ("forbidden", "not_found"):
+        pick_step()            # without a drive.file grant Google hides the file (403/404) until it is picked
+        st.button("Uitloggen", on_click=auth.logout, width="stretch")
+        st.stop()
+    st.session_state.pop("pick_tried", None)
     st.error(ACCESS_MESSAGES.get(kind, "De private Google Sheet kon niet worden geladen."))
-    if kind in ("expired", "scope", "forbidden"):
+    if kind in ("expired", "scope"):
         st.button("Uitloggen en opnieuw inloggen", on_click=auth.logout, type="primary", width="stretch")
     else:
         st.caption(f"Technisch detail: {type(exc).__name__}")
     st.stop()
+st.session_state.pop("pick_tried", None)      # access works (again)
 
 # Conflict baselines come from what this user SAW (the previous run), not from data reloaded at submit time:
 # another session's save in between is then detected instead of silently overwritten.

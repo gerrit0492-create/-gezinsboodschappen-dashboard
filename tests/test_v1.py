@@ -233,7 +233,7 @@ def test_example_cookie_secret_is_rejected(monkeypatch):
         def get(self, k, d=None):
             return dict.get(self, k, d)
     base = {"redirect_uri": "https://x.streamlit.app/oauth2callback", "client_id": "id", "expose_tokens": "access",
-            "client_kwargs": {"scope": "openid email profile " + auth.SHEETS_SCOPE}}
+            "client_kwargs": {"scope": "openid email profile " + auth.FILE_SCOPE}}
     for secret, ok in ((auth.EXAMPLE_COOKIE_SECRET, False), ("short", False), ("x" * 40, True)):
         monkeypatch.setattr(st, "secrets", Secrets(auth=dict(base, cookie_secret=secret)))
         assert auth.login_configured() is ok

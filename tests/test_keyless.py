@@ -126,7 +126,7 @@ class Secrets(dict):
 
 
 BASE = {"redirect_uri": "https://x.streamlit.app/oauth2callback", "client_id": "id", "cookie_secret": "y" * 40,
-        "expose_tokens": "access", "client_kwargs": {"scope": "openid email profile " + auth.SHEETS_SCOPE}}
+        "expose_tokens": "access", "client_kwargs": {"scope": "openid email profile " + auth.FILE_SCOPE}}
 
 
 @pytest.mark.parametrize("change,ok", [
@@ -134,9 +134,16 @@ BASE = {"redirect_uri": "https://x.streamlit.app/oauth2callback", "client_id": "
     ({"expose_tokens": ["id", "access"]}, True),
     ({"expose_tokens": "id"}, False),                                        # access token not exposed
     ({"expose_tokens": None}, False),
-    ({"client_kwargs": {"scope": "openid email profile"}}, False),           # Sheets scope not requested
+    ({"client_kwargs": {"scope": "openid email profile"}}, False),           # drive.file not requested
     ({"client_kwargs": {"scope": "openid email profile "
                                  "https://www.googleapis.com/auth/spreadsheets.readonly"}}, False),
+    # least privilege: any broad Sheets/Drive scope next to drive.file is a configuration error
+    ({"client_kwargs": {"scope": "openid email profile https://www.googleapis.com/auth/drive.file "
+                                 "https://www.googleapis.com/auth/spreadsheets"}}, False),
+    ({"client_kwargs": {"scope": "openid email profile https://www.googleapis.com/auth/drive.file "
+                                 "https://www.googleapis.com/auth/drive"}}, False),
+    ({"client_kwargs": {"scope": "openid email profile https://www.googleapis.com/auth/drive.file "
+                                 "https://www.googleapis.com/auth/drive.readonly"}}, False),
     ({"client_kwargs": None}, False),
 ])
 def test_login_configured_requires_access_token_and_sheets_scope(monkeypatch, change, ok):
@@ -195,22 +202,32 @@ def shows_no_data(at):
 
 def test_no_access_token_shows_relogin_and_reads_nothing(monkeypatch):
     at, calls = start(monkeypatch, make_book(), token=None)
-    assert any("geen toegang tot Google Spreadsheets" in e.value for e in at.error)
+    assert any("geen toegang tot Google Drive-bestanden" in e.value for e in at.error)
     assert any("opnieuw inloggen" in b.label for b in at.button)
     assert calls == [] and shows_no_data(at)
 
 
 @pytest.mark.parametrize("exc,text", [
     (refresh_error(), "verlopen"),
-    (PermissionError(""), "Geen toegang tot de Sheet"),
-    (api_error(403, "Request had insufficient authentication scopes."), "geen toestemming voor Google Spreadsheets"),
-    (api_error(404, "Requested entity was not found."), "niet gevonden"),
+    (api_error(403, "Request had insufficient authentication scopes."), "geen toestemming gegeven"),
     (api_error(429, "Quota exceeded"), "te druk"),
+    (api_error(500, "Internal error"), "kon niet worden geladen"),
 ])
 def test_read_failures_fail_closed_with_clear_message(monkeypatch, exc, text):
     at, _ = start(monkeypatch, failing_book(exc))
     assert any(text in e.value for e in at.error), [e.value for e in at.error]
     assert shows_no_data(at)
+
+
+def picks_shown(at):
+    return any("kies het voorraadbestand" in h.value for h in at.subheader)
+
+
+@pytest.mark.parametrize("exc", [PermissionError(""), api_error(403, "The caller does not have permission"),
+                                 api_error(404, "Requested entity was not found.")])
+def test_no_file_grant_leads_to_one_time_pick_step_and_no_data(monkeypatch, exc):
+    at, _ = start(monkeypatch, failing_book(exc))
+    assert picks_shown(at) and shows_no_data(at)
 
 
 def test_permission_error_while_opening_fails_closed(monkeypatch):
@@ -223,7 +240,7 @@ def test_permission_error_while_opening_fails_closed(monkeypatch):
         raise PermissionError("")
     monkeypatch.setattr(sheet_store, "connect", no_access)
     at.run()
-    assert any("Geen toegang tot de Sheet" in e.value for e in at.error) and shows_no_data(at)
+    assert picks_shown(at) and shows_no_data(at)
 
 
 def test_token_expiring_during_a_save_is_reported_as_not_saved(monkeypatch):
@@ -258,7 +275,7 @@ def test_cached_sheet_data_is_never_served_to_another_user(monkeypatch):
     at_b.secrets["ALLOWED_EMAILS"] = list(allow)
     at_b.secrets["SHEET_ID"] = "fake"
     at_b.run()
-    assert any("Geen toegang tot de Sheet" in e.value for e in at_b.error) and shows_no_data(at_b)
+    assert picks_shown(at_b) and shows_no_data(at_b)
 
 
 def test_new_token_after_relogin_reads_fresh_not_from_old_token_cache(monkeypatch):
@@ -310,29 +327,14 @@ def test_missing_scope_is_recognised_even_when_opening_the_sheet():
     assert classify_error(info.value) == "scope"
 
 
-def test_revoke_posts_token_in_body_to_google_and_never_fails():
-    calls = []
-
-    def post(url, data, timeout):
-        calls.append((url, data, timeout))
-        return 200
-    assert auth.revoke("tok-123", post=post) is True
-    assert calls == [("https://oauth2.googleapis.com/revoke", {"token": "tok-123"}, 5)]   # token not in the URL
-
-    def down(url, data, timeout):
-        raise OSError("network down")
-    assert auth.revoke("tok-123", post=down) is False                  # logout still continues
-    assert auth.revoke(None, post=post) is False and len(calls) == 1   # nothing sent without a token
-
-
-def test_logout_revokes_before_clearing_the_session(monkeypatch):
+def test_logout_does_not_revoke_so_the_file_grant_survives(monkeypatch):
+    """Revoking would withdraw the app's authorisation incl. the drive.file grant (pick again after every logout)."""
     import streamlit as st
-    order = []
-    monkeypatch.setattr(auth, "access_token", lambda: "tok-x")
-    monkeypatch.setattr(auth, "revoke", lambda token: order.append(("revoke", token)))
-    monkeypatch.setattr(st, "logout", lambda: order.append(("logout", None)))
+    calls = []
+    monkeypatch.setattr(auth, "access_token", lambda: calls.append("token-read") or "tok-x")
+    monkeypatch.setattr(st, "logout", lambda: calls.append("logout"))
     auth.logout()
-    assert order == [("revoke", "tok-x"), ("logout", None)]
+    assert calls == ["logout"] and not hasattr(auth, "revoke")
 
 
 def test_cached_sheet_connections_expire_with_the_token():

@@ -2,9 +2,10 @@
 
 Configuration lives only in host secrets ([auth] block + ALLOWED_EMAILS); see README.
 Access decision itself is core.is_allowed (pure, tested): deny by default.
-Sheets access uses the user's own access token (st.user.tokens["access"]), requested with the
-spreadsheets scope at login. Streamlit stores that token at login and never refreshes it; Google
-access tokens expire after about an hour, after which the user logs in again.
+Sheets access uses the user's own access token (st.user.tokens["access"]) with only the drive.file scope:
+the app can reach just the file(s) the user picked for it once in Google Picker. Streamlit keeps that token
+in its signed, HttpOnly login cookie and never refreshes it; Google access tokens expire after about an hour,
+after which the user logs in again.
 """
 from __future__ import annotations
 
@@ -24,11 +25,27 @@ def current_user():
 
 
 EXAMPLE_COOKIE_SECRET = "a-long-random-string-of-at-least-32-characters"
-SHEETS_SCOPE = "https://www.googleapis.com/auth/spreadsheets"
+FILE_SCOPE = "https://www.googleapis.com/auth/drive.file"
+# Broad scopes this app must never request (least privilege: only files the user picked for this app).
+BROAD_SCOPES = {
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/spreadsheets.readonly",
+    "https://www.googleapis.com/auth/drive",
+    "https://www.googleapis.com/auth/drive.readonly",
+}
+
+
+def requested_scopes():
+    try:
+        auth = st.secrets.get("auth") or {}
+        return str((auth.get("client_kwargs") or {}).get("scope") or "").split()
+    except Exception:
+        return []
 
 
 def login_configured():
-    """[auth] present with a real cookie secret, the access token exposed and the Sheets scope requested."""
+    """[auth] present with a real cookie secret, the access token exposed, drive.file requested and no broad
+    Drive/Sheets scope requested (a broad scope is treated as a configuration error)."""
     try:
         auth = st.secrets.get("auth")
         if not auth:
@@ -36,11 +53,29 @@ def login_configured():
         secret = str(auth.get("cookie_secret") or "")
         exposed = auth.get("expose_tokens") or []
         exposed = [exposed] if isinstance(exposed, str) else [str(x) for x in exposed]
-        scope = str((auth.get("client_kwargs") or {}).get("scope") or "").split()
+        scope = set(requested_scopes())
         return bool(auth.get("redirect_uri") and auth.get("client_id") and len(secret) >= 32
-                    and secret != EXAMPLE_COOKIE_SECRET and "access" in exposed and SHEETS_SCOPE in scope)
+                    and secret != EXAMPLE_COOKIE_SECRET and "access" in exposed and FILE_SCOPE in scope
+                    and not scope & BROAD_SCOPES)
     except Exception:
         return False
+
+
+def picker_config():
+    """(api_key, app_id) for Google Picker from the secrets, or (None, None) when incomplete/invalid.
+
+    app_id is the Google Cloud project NUMBER (digits only); Picker needs it to record the drive.file grant.
+    The API key is a browser key and is visible to logged-in users' browsers by design: restrict it in Google
+    Cloud to the Picker API and to this app's URL.
+    """
+    try:
+        cfg = st.secrets.get("picker") or {}
+        api_key, app_id = str(cfg.get("api_key") or ""), str(cfg.get("app_id") or "")
+        if api_key and app_id.isdigit():
+            return api_key, app_id
+    except Exception:
+        pass
+    return None, None
 
 
 def access_token():
@@ -56,29 +91,9 @@ def login():
     st.login()
 
 
-REVOKE_URL = "https://oauth2.googleapis.com/revoke"
-
-
-def revoke(token, post=None, timeout=5):
-    """Best effort: tell Google to invalidate the access token (token in the POST body, never in a URL)."""
-    if not token:
-        return False
-    try:
-        if post is None:
-            import urllib.parse
-            import urllib.request
-
-            def post(url, data, timeout):
-                body = urllib.parse.urlencode(data).encode("ascii")
-                request = urllib.request.Request(url, data=body, method="POST", headers={
-                    "Content-Type": "application/x-www-form-urlencoded"})
-                with urllib.request.urlopen(request, timeout=timeout) as response:
-                    return response.status
-        return post(REVOKE_URL, {"token": token}, timeout) == 200
-    except Exception:
-        return False                      # logout must never fail because Google is unreachable
-
-
 def logout():
-    revoke(access_token())                # a copied token stops working now, not after ~1 hour
+    """Clear the Streamlit session. The Google token is deliberately NOT revoked: revoking removes the app's
+    authorisation including the drive.file grant for the picked file, so every user would have to pick the
+    file again after each logout. The token expires by itself after about an hour and only reaches the
+    picked file."""
     st.logout()
