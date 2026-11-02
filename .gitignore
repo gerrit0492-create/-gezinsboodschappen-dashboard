@@ -1,0 +1,26 @@
+# Secrets and credentials: never commit
+.streamlit/secrets.toml
+.env
+.env.*
+!*.example
+*.json.key
+service-account*.json
+credentials*.json
+*.json
+# Photos / receipts / data exports: never commit
+*.jpg
+*.jpeg
+*.png
+*.heic
+*.heif
+*.webp
+*.gif
+*.pdf
+*.xlsx
+*.csv
+# Python
+__pycache__/
+.pytest_cache/
+*.pyc
+.venv/
+.DS_Store
