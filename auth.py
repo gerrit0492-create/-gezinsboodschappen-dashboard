@@ -58,13 +58,17 @@ def login_configured():
 def picker_config():
     """(api_key, app_id) for Google Picker from the secrets, or (None, None) when incomplete/invalid.
 
-    app_id is the Google Cloud project NUMBER (digits only); Picker needs it to record the drive.file grant.
-    The API key is a browser key and is visible to logged-in users' browsers by design: restrict it in Google
-    Cloud to the Picker API and to this app's URL.
+    app_id is the Google Cloud project NUMBER (ASCII digits); Picker needs it to record the drive.file grant.
+    It is taken from [picker].app_id when given, otherwise from the OAuth client ID, which starts with the
+    project number ("<number>-....apps.googleusercontent.com"). The API key is a browser key and is visible to
+    logged-in users' browsers by design: restrict it in Google Cloud to the Picker API and to this app's URL.
     """
     try:
         cfg = st.secrets.get("picker") or {}
         api_key, app_id = str(cfg.get("api_key") or ""), str(cfg.get("app_id") or "")
+        if not app_id:
+            client_id = str((st.secrets.get("auth") or {}).get("client_id") or "")
+            app_id = client_id.split("-", 1)[0] if "-" in client_id else ""
         if api_key and app_id.isascii() and app_id.isdigit():
             return api_key, app_id
     except Exception:

@@ -92,11 +92,11 @@ Beperking: dit is controleren-dan-schrijven, geen atomische compare-and-swap.
 3. **Clients → Create client → Web application** met redirect-URI `https://<app-naam>.streamlit.app/oauth2callback`
    en als *Authorized JavaScript origin* `https://<app-naam>.streamlit.app`.
 4. **APIs & Services → Credentials → Create credentials → API key**: beperk tot de *Google Picker API* en tot
-   websites `https://<app-naam>.streamlit.app/*`. Noteer ook het **projectnummer** (Dashboard / Projectinfo).
+   websites `https://<app-naam>.streamlit.app/*`. Het projectnummer leest de app zelf uit de OAuth-client-ID.
 5. Deel de Google Sheet met elk toegestaan account als **Bewerker**.
 6. https://share.streamlit.io → *Create app* → deze repository, bestand `app.py`.
 7. *App settings → Secrets*: vul `.streamlit/secrets.toml.example` in (`ALLOWED_EMAILS`, `SHEET_ID`, `[auth]` met
-   `expose_tokens` en `client_kwargs`, `[picker]` met `api_key` en `app_id` = projectnummer).
+   `expose_tokens` en `client_kwargs`, `[picker]` met `api_key`).
 8. Test: inloggen, eenmalig het voorraadbestand kiezen, één telling opslaan en in de Sheet terugzien, herstarten,
    opnieuw inloggen zonder opnieuw te hoeven kiezen, en een niet-toegestaan account weigeren.
 

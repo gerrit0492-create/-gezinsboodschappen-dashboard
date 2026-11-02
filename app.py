@@ -142,7 +142,7 @@ def pick_step():
                    "Google-account de Sheet mag bewerken (Delen → Bewerker).")
     api_key, app_id = auth.picker_config()
     if not api_key:
-        st.error("Bestandskeuze is niet ingericht: [picker] api_key en app_id ontbreken in de secrets.")
+        st.error("Bestandskeuze is niet ingericht: [picker] api_key ontbreekt in de secrets.")
         return
     status, message = check_pick(picker_step(token, api_key, app_id, str(sid)), sid)
     if status == "ok":

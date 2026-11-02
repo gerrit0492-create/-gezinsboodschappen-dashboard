@@ -215,3 +215,20 @@ def test_project_number_must_be_ascii_digits(monkeypatch):
 def test_wrong_pick_message_is_honest_about_the_google_grant():
     status, message = check_pick({"id": "other", "mime": SPREADSHEET_MIME}, "sheet-1")
     assert status == "wrong_file" and "gebruikt dat bestand niet" in message and "permissions" in message
+
+
+def test_project_number_is_derived_from_the_oauth_client_id(monkeypatch):
+    import streamlit as st
+    cases = [
+        ({"picker": {"api_key": "k"}, "auth": {"client_id": "123456789012-abc123.apps.googleusercontent.com"}},
+         ("k", "123456789012")),
+        ({"picker": {"api_key": "k", "app_id": "999"}, "auth": {"client_id": "123-abc.apps.googleusercontent.com"}},
+         ("k", "999")),                                                     # explicit app_id wins
+        ({"picker": {"api_key": "k"}, "auth": {"client_id": "not-a-number.apps.googleusercontent.com"}},
+         (None, None)),
+        ({"picker": {"api_key": "k"}, "auth": {"client_id": "nodash"}}, (None, None)),
+        ({"picker": {}, "auth": {"client_id": "123-abc.apps.googleusercontent.com"}}, (None, None)),  # no key
+    ]
+    for secrets, expected in cases:
+        monkeypatch.setattr(st, "secrets", Secrets(**secrets))
+        assert auth.picker_config() == expected
