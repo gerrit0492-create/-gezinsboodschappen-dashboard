@@ -1,4 +1,4 @@
-"""Private Google Sheets adapter. Credentials are only read from Streamlit secrets.
+"""Google Sheets adapter. Access uses the logged-in user's own OAuth token; no keys are stored.
 
 Every write re-reads the target tab first and refuses to write when the header
 layout changed, the row now holds another product, or the cell was changed by
@@ -24,7 +24,6 @@ from core import (APP_COUNT, ARCHIVED, DELIVERY_KEYS, PRICE_NORMAL, PRICE_OFFER,
 
 TAB_NAMES = ["Overzicht", "Voorraad", "Aanvullijst", "Weekmenu", "Instellingen", "Leveranciers", "Bonnen", "Prijzen",
              "Weeklijst"]
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
 
 def _plain(value):
@@ -36,13 +35,45 @@ class ConflictError(RuntimeError):
     """The Sheet changed since it was loaded; nothing was written."""
 
 
-def connect(service_account: dict, sheet_id: str):
-    import gspread
-    from google.oauth2.service_account import Credentials
+def connect(access_token: str, sheet_id: str):
+    """Open the Sheet with the logged-in user's own Google access token (keyless; no service account).
 
-    creds = Credentials.from_service_account_info(dict(service_account), scopes=SCOPES)
-    client = gspread.authorize(creds)
+    The token comes from the user's Google login and is never refreshed here: when it expires, Google
+    answers 401 and google-auth raises RefreshError, which classify_error reports as 'expired'.
+    """
+    import gspread
+    from google.oauth2.credentials import Credentials
+
+    if not access_token:
+        raise PermissionError("no access token")
+    client = gspread.Client(auth=Credentials(token=access_token))
     return client.open_by_key(sheet_id)
+
+
+def classify_error(exc):
+    """Map a Google/gspread failure to: expired, scope, forbidden, not_found, rate_limited or other.
+
+    Measured behaviour with a user token: an expired token raises google.auth RefreshError; a 403 while
+    opening the Sheet is a bare PermissionError (scope and sharing problems look the same there); later
+    calls raise gspread APIError with the HTTP status and Google's message.
+    """
+    name = type(exc).__name__
+    if name == "RefreshError":
+        return "expired"
+    if name == "SpreadsheetNotFound":
+        return "not_found"
+    status = getattr(exc, "code", None)
+    if not isinstance(status, int):
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+    if status == 401:
+        return "expired"
+    if status == 403 or isinstance(exc, PermissionError):
+        return "scope" if "scope" in str(exc).lower() else "forbidden"
+    if status == 404:
+        return "not_found"
+    if status == 429:
+        return "rate_limited"
+    return "other"
 
 
 def read_all(book):

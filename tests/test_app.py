@@ -129,19 +129,19 @@ def fresh_caches(monkeypatch):
     yield
 
 
-def start(monkeypatch, book, user=ALLOWED, configured=True, allow=("ouder@example.com",)):
+def start(monkeypatch, book, user=ALLOWED, configured=True, allow=("ouder@example.com",), token="tok-ouder"):
     calls = []
 
-    def connect(account, sid):
+    def connect(access_token, sid):
         calls.append(sid)
         return book
     monkeypatch.setattr(sheet_store, "connect", connect)
     monkeypatch.setattr(auth, "current_user", lambda: dict(user))
     monkeypatch.setattr(auth, "login_configured", lambda: configured)
+    monkeypatch.setattr(auth, "access_token", token if callable(token) else (lambda: token))
     at = AppTest.from_file(APP, default_timeout=30)
     at.secrets["ALLOWED_EMAILS"] = list(allow)
     at.secrets["SHEET_ID"] = "fake"
-    at.secrets["gcp_service_account"] = {"type": "service_account"}
     at.run()
     assert not at.exception, at.exception
     return at, calls

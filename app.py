@@ -1,9 +1,11 @@
 """Gezinsboodschappen — mobile-first Streamlit dashboard over the private Google Sheet.
 
 Access: Google login (OIDC) + explicit e-mail allowlist, checked before any Sheet data is read.
+Sheet access is keyless: the logged-in user's own Google access token (spreadsheets scope) is used.
 """
 from __future__ import annotations
 
+import hashlib
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -17,7 +19,8 @@ from core import (CHECK_WINDOW_DAYS, DELIVERY_KEYS, MAX_BUDGET, PRICE_NORMAL, PR
                   number, pack_size, pack_to_row_unit_price, parse_date, parse_receipt_lines, savings,
                   schema_problems, settings_map, shopping_totals, stock_state, supplier_rows, table_rows, text,
                   valid_amount, weeklijst_rows)
-from sheet_store import (ConflictError, PartialSaveError, add_product, archive_product, connect, read_all, write_basket,
+from sheet_store import (ConflictError, PartialSaveError, add_product, archive_product, classify_error, connect, read_all,
+                         write_basket,
                          write_delivery, write_details, write_menu, write_price, write_receipts, write_stock,
                          write_supplier_check, write_weeklijst)
 
@@ -67,39 +70,74 @@ def saved(message):
     st.rerun()
 
 
+ACCESS_MESSAGES = {
+    "expired": "Je Google-sessie voor de Sheet is verlopen (dat gebeurt na ongeveer een uur). Log uit en log "
+               "opnieuw in.",
+    "scope": "Bij het inloggen is geen toestemming voor Google Spreadsheets gegeven. Log uit, log opnieuw in en "
+             "sta toegang tot Google Spreadsheets toe.",
+    "forbidden": "Geen toegang tot de Sheet: sta bij het inloggen toegang tot Google Spreadsheets toe, en zorg dat "
+                 "dit Google-account de Sheet mag bewerken (Delen → Bewerker).",
+    "not_found": "De Sheet is niet gevonden: controleer SHEET_ID en of dit Google-account toegang heeft.",
+    "rate_limited": "Google is even te druk (limiet bereikt). Probeer het over een minuut opnieuw.",
+}
+
+
 def save_failed(exc):
     status = getattr(getattr(exc, "response", None), "status_code", None)
+    kind = classify_error(exc)
     if isinstance(exc, PartialSaveError):
         st.error(f"Deels opgeslagen: {exc}")
     elif isinstance(exc, (ConflictError, ValueError)):
         st.error(f"Niet opgeslagen: {exc}")
+    elif kind in ACCESS_MESSAGES:
+        st.error(f"Niet opgeslagen: {ACCESS_MESSAGES[kind]}")    # Google rejected the request: nothing changed
     elif type(exc).__name__ == "WorksheetNotFound" or (isinstance(status, int) and 400 <= status < 500):
         st.error(f"Niet opgeslagen: Google weigerde de wijziging ({type(exc).__name__} {status or ''}). "
-                 "Controleer de Sheet-inrichting en de Editor-toegang van de serviceaccount.")
+                 "Controleer de Sheet-inrichting.")
     else:
         st.error(f"Opslaan onzeker ({type(exc).__name__}): het is niet zeker of de wijziging is aangekomen. "
                  "Klik 'Vernieuw data' en controleer de waarde vóór je opnieuw opslaat.")
 
 
+sid = secret("SHEET_ID")
+if not sid:
+    st.error("Google Sheets-koppeling niet ingericht: SHEET_ID ontbreekt in de secrets.")
+    st.stop()
+token = auth.access_token()
+if not token:
+    st.error("Je sessie heeft geen toegang tot Google Spreadsheets. Log uit en log opnieuw in, en sta toegang tot "
+             "Google Spreadsheets toe.")
+    st.button("Uitloggen en opnieuw inloggen", on_click=auth.logout, type="primary", width="stretch")
+    st.stop()
+# Caches are keyed per user AND per token: a Sheet read with one person's token is never served to another
+# session. Only a hash of the token is used as key; the token itself is never shown, logged or stored.
+token_key = hashlib.sha256(token.encode("utf-8")).hexdigest()
+user_key = text(user.get("email")).casefold()
+
+
+@st.cache_resource(max_entries=20, show_spinner=False)
+def _open_sheet(token_key, _token, _sheet_id):
+    return connect(_token, _sheet_id)
+
+
+def spreadsheet():
+    return _open_sheet(token_key, token, str(sid))
+
+
+@st.cache_data(ttl=60, max_entries=20, show_spinner=False)
+def snapshot(user_key, token_key):
+    return read_all(spreadsheet())
+
+
 try:
-    account = secret("gcp_service_account")
-    sid = secret("SHEET_ID")
-    if not account or not sid:
-        st.error("Google Sheets-koppeling niet ingericht. Voeg SHEET_ID en gcp_service_account toe aan de secrets.")
-        st.stop()
-
-    @st.cache_resource
-    def spreadsheet():
-        return connect(dict(account), str(sid))
-
-    @st.cache_data(ttl=60, show_spinner=False)
-    def snapshot():
-        return read_all(spreadsheet())
-
-    data = snapshot()
+    data = snapshot(user_key, token_key)
 except Exception as exc:
-    st.error("De private Google Sheet kon niet worden geladen. Controleer de serviceaccount-toegang en de Sheet-ID.")
-    st.caption(f"Technisch detail: {type(exc).__name__}")
+    kind = classify_error(exc)
+    st.error(ACCESS_MESSAGES.get(kind, "De private Google Sheet kon niet worden geladen."))
+    if kind in ("expired", "scope", "forbidden"):
+        st.button("Uitloggen en opnieuw inloggen", on_click=auth.logout, type="primary", width="stretch")
+    else:
+        st.caption(f"Technisch detail: {type(exc).__name__}")
     st.stop()
 
 # Conflict baselines come from what this user SAW (the previous run), not from data reloaded at submit time:
