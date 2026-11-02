@@ -183,3 +183,35 @@ def test_pick_without_resulting_access_explains_instead_of_looping(monkeypatch):
     at.run()
     assert any("nog geen toegang" in w.value for w in at.warning) and shows_no_data(at)
     assert calls["n"] <= 3                                                   # one rerun after the pick, no loop
+
+
+# --- review M1 / m1 regressions ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("scope,ok", [
+    ("openid email profile https://www.googleapis.com/auth/drive.file", True),
+    ("https://www.googleapis.com/auth/drive.file profile email openid", True),          # order irrelevant
+    ("openid email profile https://www.googleapis.com/auth/drive.file https://mail.google.com/", False),
+    ("openid email profile https://www.googleapis.com/auth/drive.file "
+     "https://www.googleapis.com/auth/drive.metadata.readonly", False),
+    ("openid email profile https://www.googleapis.com/auth/drive.file "
+     "https://www.googleapis.com/auth/calendar", False),
+    ("email profile https://www.googleapis.com/auth/drive.file", False),                # openid missing
+    ("openid email profile https://www.googleapis.com/auth/drive.file x", False),
+])
+def test_scopes_must_be_exactly_login_plus_drive_file(monkeypatch, scope, ok):
+    import streamlit as st
+    cfg = {"redirect_uri": "https://x.streamlit.app/oauth2callback", "client_id": "id", "cookie_secret": "y" * 40,
+           "expose_tokens": "access", "client_kwargs": {"scope": scope}}
+    monkeypatch.setattr(st, "secrets", Secrets(auth=cfg))
+    assert auth.login_configured() is ok
+
+
+def test_project_number_must_be_ascii_digits(monkeypatch):
+    import streamlit as st
+    monkeypatch.setattr(st, "secrets", Secrets(picker={"api_key": "k", "app_id": "１２３"}))   # full-width digits
+    assert auth.picker_config() == (None, None)
+
+
+def test_wrong_pick_message_is_honest_about_the_google_grant():
+    status, message = check_pick({"id": "other", "mime": SPREADSHEET_MIME}, "sheet-1")
+    assert status == "wrong_file" and "gebruikt dat bestand niet" in message and "permissions" in message

@@ -26,13 +26,8 @@ def current_user():
 
 EXAMPLE_COOKIE_SECRET = "a-long-random-string-of-at-least-32-characters"
 FILE_SCOPE = "https://www.googleapis.com/auth/drive.file"
-# Broad scopes this app must never request (least privilege: only files the user picked for this app).
-BROAD_SCOPES = {
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/spreadsheets.readonly",
-    "https://www.googleapis.com/auth/drive",
-    "https://www.googleapis.com/auth/drive.readonly",
-}
+# The ONLY scopes the app may request: login identity + per-file access. Anything else is refused.
+ALLOWED_SCOPES = {"openid", "email", "profile", FILE_SCOPE}
 
 
 def requested_scopes():
@@ -44,8 +39,8 @@ def requested_scopes():
 
 
 def login_configured():
-    """[auth] present with a real cookie secret, the access token exposed, drive.file requested and no broad
-    Drive/Sheets scope requested (a broad scope is treated as a configuration error)."""
+    """[auth] present with a real cookie secret, the access token exposed and EXACTLY the scopes
+    openid, email, profile and drive.file (any other scope is treated as a configuration error)."""
     try:
         auth = st.secrets.get("auth")
         if not auth:
@@ -55,8 +50,7 @@ def login_configured():
         exposed = [exposed] if isinstance(exposed, str) else [str(x) for x in exposed]
         scope = set(requested_scopes())
         return bool(auth.get("redirect_uri") and auth.get("client_id") and len(secret) >= 32
-                    and secret != EXAMPLE_COOKIE_SECRET and "access" in exposed and FILE_SCOPE in scope
-                    and not scope & BROAD_SCOPES)
+                    and secret != EXAMPLE_COOKIE_SECRET and "access" in exposed and scope == ALLOWED_SCOPES)
     except Exception:
         return False
 
@@ -71,7 +65,7 @@ def picker_config():
     try:
         cfg = st.secrets.get("picker") or {}
         api_key, app_id = str(cfg.get("api_key") or ""), str(cfg.get("app_id") or "")
-        if api_key and app_id.isdigit():
+        if api_key and app_id.isascii() and app_id.isdigit():
             return api_key, app_id
     except Exception:
         pass

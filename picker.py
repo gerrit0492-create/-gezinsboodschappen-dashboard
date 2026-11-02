@@ -82,7 +82,7 @@ export default function (component) {
   }
 
   button.onclick = openPicker;
-  return () => { token = null; button.onclick = null; };   // cleanup on unmount: token dropped from memory
+  return () => { token = null; button.onclick = null; };   // cleanup on unmount (Streamlit drops the element data too)
 }
 """
 
@@ -134,5 +134,6 @@ def check_pick(picked, sheet_id):
                         "een computer; daarna werkt de app ook op je iPhone."
     if str(picked.get("id") or "") == str(sheet_id) and picked.get("mime") == SPREADSHEET_MIME:
         return "ok", "Voorraadbestand gekozen; de app controleert nu de toegang."
-    return "wrong_file", "Dat is niet het ingestelde voorraadbestand. Er is niets met dat bestand gedaan; kies het " \
-                         "juiste bestand."
+    return "wrong_file", "Dat is niet het ingestelde voorraadbestand. De app gebruikt dat bestand niet; kies het " \
+                         "juiste bestand. (Google onthoudt wel dat je het met deze app koos; dat kun je intrekken via " \
+                         "myaccount.google.com/permissions.)"

@@ -15,13 +15,18 @@ Deze repository bevat **alleen applicatiecode**. Alle gegevens (voorraad, prijze
   (`st.user.tokens["access"]`) met **alleen** de scope `https://www.googleapis.com/auth/drive.file`. Daarmee kan de app
   uitsluitend bestanden gebruiken die de gebruiker er zelf voor kiest. Elke toegestane gebruiker kiest de voorraad-Sheet
   **eenmalig** in Google Picker; Google onthoudt die keuze per gebruiker. Brede scopes (`spreadsheets`, `drive`) worden
-  door de app geweigerd. Er is geen serviceaccount en geen sleutelbestand.
+  door de app geweigerd: de scopes moeten exact `openid email profile` plus `drive.file` zijn. Er is geen
+  serviceaccount en geen sleutelbestand. Kiest iemand per ongeluk een ander bestand, dan gebruikt de app dat niet,
+  maar Google onthoudt die keuze; intrekken kan via https://myaccount.google.com/permissions.
+- Was de app eerder met de brede `spreadsheets`-scope gebruikt, trek die oude toestemming dan in via
+  https://myaccount.google.com/permissions en log opnieuw in.
 - De app gebruikt nooit het bestand dat de Picker teruggeeft: het opent alleen `SHEET_ID` uit de secrets en vergelijkt
   de keuze daarmee. Een verkeerde of gemanipuleerde keuze geeft geen toegang. Elke gebruiker moet de Sheet ook zelf
   mogen bewerken (Delen → Bewerker).
 - Het token wordt alleen server-side en voor de Picker in het geheugen van de browser gebruikt; deze app schrijft het
   nooit naar localStorage, sessionStorage, cookies, de URL of logs. Streamlit zelf bewaart het bij het inloggen in zijn
-  ondertekende, HttpOnly login-cookie (niet leesbaar voor JavaScript). Gegevens worden per gebruiker en per token
+  ondertekende (niet versleutelde), HttpOnly login-cookie (niet leesbaar voor JavaScript). Tijdens de eenmalige
+  bestandskeuze staat het token kort in het geheugen van de pagina, omdat Google Picker het nodig heeft. Gegevens worden per gebruiker en per token
   gecachet en nooit gedeeld tussen gebruikers.
 - **Sessieduur**: Google-toegangstokens verlopen na ongeveer een uur; daarna meldt de app "sessie verlopen" en log je
   opnieuw in (de bestandskeuze blijft bewaard). Er worden geen refresh-tokens gebruikt, dus de 7-dagenlimiet van

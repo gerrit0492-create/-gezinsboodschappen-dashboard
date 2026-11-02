@@ -152,9 +152,9 @@ def pick_step():
         st.rerun()
     elif status:
         st.warning(message)
-    st.caption("Zie je het bestand niet in de lijst? Dan heeft dit Google-account geen toegang tot de Sheet: laat de "
-               "eigenaar hem met je delen als Bewerker. Lukt kiezen op de iPhone niet, doe het dan eenmalig op een "
-               "computer; daarna werkt de app ook op de iPhone.")
+    st.caption("Zie je het bestand niet in de lijst? Dan heeft dit Google-account geen toegang tot de Sheet (laat de "
+               "eigenaar hem met je delen als Bewerker), of SHEET_ID in de app-instellingen klopt niet. Lukt kiezen op "
+               "de iPhone niet, doe het dan eenmalig op een computer; daarna werkt de app ook op de iPhone.")
 
 
 try:
