@@ -23,11 +23,11 @@ Deze repository bevat **alleen applicatiecode**. Alle gegevens (voorraad, prijze
 - De app gebruikt nooit het bestand dat de Picker teruggeeft: het opent alleen `SHEET_ID` uit de secrets en vergelijkt
   de keuze daarmee. Een verkeerde of gemanipuleerde keuze geeft geen toegang. Elke gebruiker moet de Sheet ook zelf
   mogen bewerken (Delen → Bewerker).
-- Het token wordt alleen server-side en voor de Picker in het geheugen van de browser gebruikt; deze app schrijft het
-  nooit naar localStorage, sessionStorage, cookies, de URL of logs. Streamlit zelf bewaart het bij het inloggen in zijn
-  ondertekende (niet versleutelde), HttpOnly login-cookie (niet leesbaar voor JavaScript). Tijdens de eenmalige
-  bestandskeuze staat het token kort in het geheugen van de pagina, omdat Google Picker het nodig heeft. Gegevens worden per gebruiker en per token
-  gecachet en nooit gedeeld tussen gebruikers.
+- De bestandskeuze opent op een eigen Google-pagina via OAuth met uitsluitend `drive.file`. De callback
+  is kort geldig, ondertekend en aan de bestaande login gebonden. PKCE beschermt de autorisatiecode.
+  De app wisselt die server-side in en gebruikt voor de Sheet altijd het toegangstoken van de bestaande login.
+  Streamlit bewaart het logintoken in zijn ondertekende HttpOnly login-cookie. Gegevens worden per gebruiker
+  en per token gecachet.
 - **Sessieduur**: Google-toegangstokens verlopen na ongeveer een uur; daarna meldt de app "sessie verlopen" en log je
   opnieuw in (de bestandskeuze blijft bewaard). Er worden geen refresh-tokens gebruikt, dus de 7-dagenlimiet van
   Google's OAuth-testmodus speelt niet. Uitloggen trekt het token bewust niet in bij Google: dat zou ook de
@@ -89,15 +89,14 @@ Beperking: dit is controleren-dan-schrijven, geen atomische compare-and-swap.
 2. **Google Auth Platform**: Audience *External*, status *Testing*, toegestane accounts als **testgebruikers**.
    Onder **Data Access** alleen de scope `https://www.googleapis.com/auth/drive.file` (niet-gevoelig; geen
    "app niet geverifieerd"-melding voor deze scope).
-3. **Clients → Create client → Web application** met redirect-URI `https://<app-naam>.streamlit.app/oauth2callback`
-   en als *Authorized JavaScript origin* `https://<app-naam>.streamlit.app`.
-4. **APIs & Services → Credentials → Create credentials → API key**: beperk tot de *Google Picker API* en tot
-   websites `https://<app-naam>.streamlit.app/*`. Het projectnummer leest de app zelf uit de OAuth-client-ID.
-5. Deel de Google Sheet met elk toegestaan account als **Bewerker**.
-6. https://share.streamlit.io → *Create app* → deze repository, bestand `app.py`.
-7. *App settings → Secrets*: vul `.streamlit/secrets.toml.example` in (`ALLOWED_EMAILS`, `SHEET_ID`, `[auth]` met
-   `expose_tokens` en `client_kwargs`, `[picker]` met `api_key`).
-8. Test: inloggen, eenmalig het voorraadbestand kiezen, één telling opslaan en in de Sheet terugzien, herstarten,
+3. Gebruik dezelfde **Web application**-client. Voeg onder *Authorized redirect URIs* naast de bestaande
+   `https://<app-naam>.streamlit.app/oauth2callback` ook `https://<app-naam>.streamlit.app/` toe.
+   De tweede URI ontvangt uitsluitend de bestandskeuze. De afsluitende slash hoort erbij.
+4. Deel de Google Sheet met elk toegestaan account als **Bewerker**.
+5. https://share.streamlit.io → *Create app* → deze repository, bestand `app.py`.
+6. Vul onder *App settings → Secrets* `.streamlit/secrets.toml.example` in. De bestandskeuze gebruikt
+   dezelfde OAuth-client en heeft geen Picker API-key nodig.
+7. Test: inloggen, eenmalig het voorraadbestand kiezen, één telling opslaan en in de Sheet terugzien, herstarten,
    opnieuw inloggen zonder opnieuw te hoeven kiezen, en een niet-toegestaan account weigeren.
 
 ## Lokaal ontwikkelen

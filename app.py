@@ -14,7 +14,7 @@ import streamlit as st
 
 import auth
 import scan
-from picker import check_pick, picker_step
+from picker import CALLBACK_FIELDS, Picker
 from core import (CHECK_WINDOW_DAYS, DELIVERY_KEYS, MAX_BUDGET, PRICE_NORMAL, PRICE_OFFER, classify_inventory,
                   compare_suppliers, confirmations, delivery_check, effective_budget, expiring, go_decision,
                   is_active, is_allowed, latest_price, low_stock, match_barcodes, new_receipt_rows, normalised_price,
@@ -133,30 +133,36 @@ def snapshot(user_key, token_key):
     return read_all(spreadsheet())
 
 
+picker = Picker.from_login(secret("auth"), str(sid), token)
+if any(key in st.query_params for key in ("code", "state", "error", "picked_file_ids")):
+    callback = {key: st.query_params.get_all(key) for key in CALLBACK_FIELDS if key in st.query_params}
+    st.query_params.clear()
+    result = picker.complete(callback) if picker else "invalid"
+    st.session_state["pick_tried"] = result == "ok"
+    if result == "ok":
+        _open_sheet.clear(token_key, token, str(sid))
+        snapshot.clear(user_key, token_key)
+    messages = {
+        "cancelled": "Je hebt de bestandskeuze geannuleerd.",
+        "wrong_file": "Dat is niet het ingestelde voorraadbestand.",
+        "invalid": "Deze bestandskeuze is verlopen of hoort niet bij je huidige aanmelding.",
+        "failed": "Google kon de bestandskeuze niet bevestigen.",
+    }
+    if result in messages:
+        st.warning(messages[result])
+
+
 def pick_step():
-    """One-time Google Picker choice of the stock Sheet (drive.file). Only reached after login, verified e-mail,
-    allowlist and token checks; the picked ID is only compared with SHEET_ID, never used for access."""
+    """Open Google as a top-level page. Sheet access still uses the current login and fixed SHEET_ID."""
     st.subheader("Eenmalig: kies het voorraadbestand")
-    st.write("Deze app mag alleen bestanden gebruiken die jij er zelf voor kiest. Kies één keer de voorraad-Sheet "
-             "in Google Drive; Google onthoudt die keuze daarna voor jouw account.")
     if st.session_state.get("pick_tried"):
-        st.warning("Na het kiezen is er nog geen toegang. Controleer of je het juiste bestand koos en of dit "
-                   "Google-account de Sheet mag bewerken (Delen → Bewerker).")
-    api_key, app_id = auth.picker_config()
-    if not api_key:
-        st.error("Bestandskeuze is niet ingericht: [picker] api_key ontbreekt in de secrets.")
+        st.warning("Na het kiezen is er nog geen toegang. Controleer of je dit bestand als Bewerker mag openen "
+                   "met hetzelfde Google-account. Log zo nodig opnieuw in om de toegang te verversen.")
+    if not picker:
+        st.error("Bestandskeuze is niet ingericht: controleer de bestaande Google-login in Secrets.")
         return
-    status, message = check_pick(picker_step(token, api_key, app_id, str(sid)), sid)
-    if status == "ok":
-        st.session_state["pick_tried"] = True
-        st.cache_data.clear()
-        st.cache_resource.clear()
-        st.rerun()
-    elif status:
-        st.warning(message)
-    st.caption("Zie je het bestand niet in de lijst? Dan heeft dit Google-account geen toegang tot de Sheet (laat de "
-               "eigenaar hem met je delen als Bewerker), of SHEET_ID in de app-instellingen klopt niet. Lukt kiezen op "
-               "de iPhone niet, doe het dan eenmalig op een computer; daarna werkt de app ook op de iPhone.")
+    st.write("Google opent in een nieuw tabblad en brengt je na de bestandskeuze terug naar de app.")
+    st.link_button("Voorraadbestand kiezen", picker.authorization_url(user_key), type="primary", width="stretch")
 
 
 try:
