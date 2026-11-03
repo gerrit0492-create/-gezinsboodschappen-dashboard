@@ -1,139 +1,119 @@
-"""One-time Google Picker step for the drive.file scope.
+"""Google's top-level, drive.file-only Picker flow."""
 
-With drive.file the app may only use files the user explicitly opened with it. The user picks the existing
-stock Sheet once in Google Picker; Google then records a per-user, per-file grant for this app (OAuth client /
-Cloud project), which persists across logins until the user removes the app's access in their Google account.
-
-Security model:
-- The Picker runs in the user's own browser with the user's own access token (needed by Picker to show the
-  user's files). The token is only held in JavaScript memory for that moment: nothing is written to
-  localStorage, sessionStorage, cookies or the URL by this code.
-- The picked file ID is NEVER used for access. The server only ever opens SHEET_ID from the secrets; the pick
-  result is only compared with it, so a wrong or manipulated pick cannot grant access to anything else.
-"""
 from __future__ import annotations
 
-import streamlit as st
+import base64
+import hashlib
+import hmac
+import json
+import re
+import secrets
+import time
+from dataclasses import dataclass, field
+from urllib.parse import urlencode, urlsplit
 
+import requests
+
+from auth import FILE_SCOPE
+
+AUTHORIZE_URL = "https://accounts.google.com/o/oauth2/v2/auth"
+TOKEN_URL = "https://oauth2.googleapis.com/token"
 SPREADSHEET_MIME = "application/vnd.google-apps.spreadsheet"
+STATE_TTL = 600
+CALLBACK_FIELDS = {"code", "state", "picked_file_ids", "scope", "error", "error_description", "authuser", "prompt"}
+_STATE = re.compile(r"picker\.(\d{1,12})\.([0-9a-f]{32})\.([0-9a-f]{64})")
 
-_JS = r"""
-export default function (component) {
-  const { data, parentElement, setTriggerValue } = component;
-  const button = parentElement.querySelector("button");
-  const status = parentElement.querySelector(".status");
-  let token = data && data.token;              // memory only; never persisted
 
-  function loadGapi() {
-    return new Promise((resolve, reject) => {
-      if (window.gapi && window.gapi.load) { resolve(); return; }
-      const s = document.createElement("script");
-      s.src = "https://apis.google.com/js/api.js";
-      s.async = true;
-      s.onload = () => resolve();
-      s.onerror = () => reject(new Error("load"));
-      document.head.appendChild(s);
-    });
-  }
+@dataclass(frozen=True)
+class Picker:
+    client_id: str
+    client_secret: str = field(repr=False)
+    signing_key: str = field(repr=False)
+    redirect_uri: str
+    sheet_id: str
+    login_token: str = field(repr=False)
 
-  function topOrigin() {
-    try { return window.top.location.origin; } catch (e) { return window.location.origin; }
-  }
+    @classmethod
+    def from_login(cls, config, sheet_id, login_token):
+        """Reuse the existing web client. Streamlit's /oauth2callback remains reserved for login."""
+        if not config or not sheet_id or not login_token:
+            return None
+        client_id = config.get("client_id")
+        client_secret = config.get("client_secret")
+        signing_key = config.get("cookie_secret")
+        if not all(isinstance(value, str) and value for value in (client_id, client_secret, signing_key)):
+            return None
+        if len(signing_key) < 32:
+            return None
+        try:
+            url = urlsplit(str(config.get("redirect_uri", "")))
+        except ValueError:
+            return None
+        if (url.scheme != "https" or not url.hostname or url.username or url.password
+                or url.path != "/oauth2callback" or url.query or url.fragment):
+            return None
+        return cls(client_id, client_secret, signing_key, url._replace(path="/").geturl(), sheet_id, login_token)
 
-  async function openPicker() {
-    button.disabled = true;
-    status.textContent = "Google Drive openen…";
-    try {
-      await loadGapi();
-      await new Promise((resolve) => window.gapi.load("picker", { callback: resolve }));
-      const view = new google.picker.DocsView(google.picker.ViewId.SPREADSHEETS)
-        .setMimeTypes(data.mime)
-        .setMode(google.picker.DocsViewMode.LIST);
-      try { if (data.fileId && view.setFileIds) { view.setFileIds(data.fileId); } } catch (e) { /* older Picker */ }
-      const picker = new google.picker.PickerBuilder()
-        .addView(view)
-        .setOAuthToken(token)
-        .setDeveloperKey(data.apiKey)
-        .setAppId(data.appId)
-        .setOrigin(topOrigin())
-        .setTitle("Kies het voorraadbestand")
-        .setCallback((res) => {
-          const action = res[google.picker.Response.ACTION];
-          if (action === google.picker.Action.PICKED) {
-            const doc = res[google.picker.Response.DOCUMENTS][0];
-            button.disabled = false;                 // a wrong pick can be corrected right away
-            status.textContent = "Gekozen; de app controleert de toegang…";
-            setTriggerValue("picked", { id: String(doc[google.picker.Document.ID] || ""),
-                                         mime: String(doc[google.picker.Document.MIME_TYPE] || "") });
-          } else if (action === google.picker.Action.CANCEL) {
-            button.disabled = false;
-            status.textContent = "Geannuleerd.";
-            setTriggerValue("picked", { cancelled: true });
-          }
+    def _digest(self, purpose, ticket):
+        # Separate MAC and PKCE purposes. Bind the callback to the current browser's login
+        # token and this exact configuration, including when the redirect creates a new session.
+        context = json.dumps([purpose, ticket, self.login_token, self.client_id, self.redirect_uri, self.sheet_id])
+        return hmac.new(self.signing_key.encode(), context.encode(), hashlib.sha256).digest()
+
+    def _verifier(self, ticket):
+        return self._digest("pkce", ticket).hex()
+
+    def authorization_url(self, email):
+        ticket = f"picker.{int(time.time())}.{secrets.token_hex(16)}"
+        challenge = hashlib.sha256(self._verifier(ticket).encode()).digest()
+        return AUTHORIZE_URL + "?" + urlencode({
+            "client_id": self.client_id,
+            "redirect_uri": self.redirect_uri,
+            "response_type": "code",
+            "scope": FILE_SCOPE,
+            "include_granted_scopes": "false",
+            "prompt": "consent",
+            "trigger_onepick": "true",
+            "mimetypes": SPREADSHEET_MIME,
+            "file_ids": self.sheet_id,
+            "login_hint": email,
+            "state": ticket + "." + self._digest("state", ticket).hex(),
+            "code_challenge": base64.urlsafe_b64encode(challenge).decode().rstrip("="),
+            "code_challenge_method": "S256",
         })
-        .build();
-      picker.setVisible(true);
-      status.textContent = "";
-    } catch (e) {
-      button.disabled = false;
-      status.textContent = "Google Drive kon niet worden geopend. Probeer het opnieuw of gebruik een computer.";
-      setTriggerValue("picked", { error: "load" });
-    }
-  }
 
-  button.onclick = openPicker;
-  return () => { token = null; button.onclick = null; };   // cleanup on unmount (Streamlit drops the element data too)
-}
-"""
-
-_HTML = """
-<div class="picker-step">
-  <button type="button">📄 Voorraadbestand kiezen in Google Drive</button>
-  <div class="status" aria-live="polite"></div>
-</div>
-"""
-
-_CSS = """
-button { width: 100%; padding: 0.7rem; border-radius: 0.5rem; border: 1px solid var(--st-primary-color);
-         background: var(--st-primary-color); color: white; font-size: 1rem; }
-button:disabled { opacity: 0.6; }
-.status { margin-top: 0.4rem; font-size: 0.9rem; }
-"""
-
-_component = None
-
-
-def _get_component():
-    global _component
-    if _component is None:
-        _component = st.components.v2.component("voorraad_picker", html=_HTML, css=_CSS, js=_JS)
-    return _component
-
-
-def picker_step(token, api_key, app_id, sheet_id, key="voorraad_picker"):
-    """Render the Picker button; returns the trigger value dict from the browser, or None."""
-    result = _get_component()(
-        key=key,
-        data={"token": token, "apiKey": api_key, "appId": app_id, "fileId": sheet_id, "mime": SPREADSHEET_MIME},
-        on_picked_change=lambda: None,
-    )
-    return getattr(result, "picked", None)
-
-
-def check_pick(picked, sheet_id):
-    """Interpret the browser's answer. Returns (status, message); the picked ID is only compared, never used.
-
-    status: 'ok' (the configured Sheet was picked), 'wrong_file', 'cancelled', 'error' or None (nothing yet).
-    """
-    if not isinstance(picked, dict) or not picked:
-        return None, ""
-    if picked.get("cancelled"):
-        return "cancelled", "Je hebt niets gekozen. Kies het voorraadbestand om verder te gaan."
-    if picked.get("error"):
-        return "error", "Google Drive kon niet worden geopend. Probeer het opnieuw, of kies het bestand eenmalig op " \
-                        "een computer; daarna werkt de app ook op je iPhone."
-    if str(picked.get("id") or "") == str(sheet_id) and picked.get("mime") == SPREADSHEET_MIME:
-        return "ok", "Voorraadbestand gekozen; de app controleert nu de toegang."
-    return "wrong_file", "Dat is niet het ingestelde voorraadbestand. De app gebruikt dat bestand niet; kies het " \
-                         "juiste bestand. (Google onthoudt wel dat je het met deze app koos; dat kun je intrekken via " \
-                         "myaccount.google.com/permissions.)"
+    def complete(self, callback):
+        """Validate the return and redeem its code once. The current login remains authoritative."""
+        if any(len(values) != 1 for values in callback.values()):
+            return "invalid"
+        state = callback.get("state", [""])[0]
+        match = _STATE.fullmatch(state)
+        if not match or not 0 <= time.time() - int(match[1]) < STATE_TTL:
+            return "invalid"
+        ticket = state.rsplit(".", 1)[0]
+        if not hmac.compare_digest(match[3], self._digest("state", ticket).hex()):
+            return "invalid"
+        if callback.get("error"):
+            return "cancelled" if callback["error"][0] == "access_denied" else "invalid"
+        code = callback.get("code", [""])[0]
+        if not code:
+            return "invalid"
+        if callback.get("picked_file_ids") != [self.sheet_id]:
+            return "wrong_file"
+        try:
+            response = requests.post(TOKEN_URL, data={
+                "grant_type": "authorization_code",
+                "code": code,
+                "client_id": self.client_id,
+                "client_secret": self.client_secret,
+                "redirect_uri": self.redirect_uri,
+                "code_verifier": self._verifier(ticket),
+            }, timeout=10, allow_redirects=False)
+            if response.status_code == 200:
+                grant = response.json()
+                if (isinstance(grant, dict) and grant.get("access_token")
+                        and grant.get("scope", FILE_SCOPE) == FILE_SCOPE):
+                    return "ok"
+        except (requests.RequestException, ValueError):
+            return "failed"  # Never display errors or OAuth responses containing credentials.
+        return "failed"
