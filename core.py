@@ -21,6 +21,7 @@ undated prices are never used.
 """
 from __future__ import annotations
 
+import hashlib
 import math
 from datetime import date, datetime, timedelta
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
@@ -60,8 +61,11 @@ DELIVERY_KEYS = {
     "date": "Bezorgdatum",
     "source": "Bezorgkosten bron",
     "basket": "Mandtotaal checkout",
+    "basket_list": "Mandtotaal voor lijst",
 }
-ADDABLE_SETTINGS = {"Mandtotaal checkout"}   # write_delivery adds this key row itself when it is missing
+# write_delivery adds these key rows itself when missing. 'Mandtotaal voor lijst' = fingerprint of the order lines the
+# checkout total was read for: a changed list makes the stored checkout total stale.
+ADDABLE_SETTINGS = {"Mandtotaal checkout", "Mandtotaal voor lijst"}
 REQUIRED_SETTINGS = ["Weekbudget"] + [k for k in DELIVERY_KEYS.values() if k not in ADDABLE_SETTINGS]
 
 # Row unit in the Sheet -> (unit the user types a price in, factor).
@@ -277,7 +281,7 @@ def delivery_check(settings, today):
     get = lambda k: (settings.get(DELIVERY_KEYS[k]) or {}).get("value")
     amount, verified = number(get("amount")), parse_date(get("verified"))
     when, supplier, source = parse_date(get("date")), text(get("supplier")), text(get("source"))
-    basket = number(get("basket"))
+    basket, basket_list = number(get("basket")), text(get("basket_list"))
     problems = []
     if not supplier:
         problems.append("leverancier ontbreekt")
@@ -300,7 +304,8 @@ def delivery_check(settings, today):
     basket_problem = None if basket is not None and basket >= 0 else "mandtotaal uit de checkout ontbreekt"
     return {"ok": not problems, "problems": problems, "amount": None if amount is None else round(amount, 2),
             "verified": verified, "date": when, "supplier": supplier, "source": source,
-            "basket": None if basket_problem else round(basket, 2), "basket_problem": basket_problem}
+            "basket": None if basket_problem else round(basket, 2), "basket_problem": basket_problem,
+            "basket_list": basket_list}
 
 
 def price_status(item, delivery):
@@ -370,12 +375,36 @@ def is_active(item):
     return text(item.get("Status")).casefold() != ARCHIVED.casefold()
 
 
+def price_kind(row):
+    """Canonical Prijssoort ('Normaal', 'Aanbieding', 'Open data') compared case-insensitively; else the raw text."""
+    raw = text((row or {}).get("Prijssoort"))
+    return next((k for k in (PRICE_NORMAL, PRICE_OFFER, OPEN_DATA) if k.casefold() == raw.casefold()), raw)
+
+
+def is_open_data(row):
+    return price_kind(row) == OPEN_DATA
+
+
+def confirmed_row(prices, product, supplier):
+    """The single non-open-data Prijzen row for product + supplier as the writer finds it (None if none/several)."""
+    rows = [p for p in prices or [] if not is_open_data(p)
+            and same_name(p.get("Product"), product) and same_name(p.get("Leverancier"), supplier)]
+    return rows[0] if len(rows) == 1 else None
+
+
+def order_fingerprint(rows):
+    """Short fingerprint of the order lines (product + Te bestellen > 0) a checkout total was read for."""
+    lines = sorted((text(r.get("Product")).casefold(), round(number(r.get("Te bestellen")) or 0, 6)) for r in rows or []
+                   if text(r.get("Product")) and (number(r.get("Te bestellen")) or 0) > 0)
+    return hashlib.sha256(repr(lines).encode("utf-8")).hexdigest()[:12]
+
+
 def latest_price(prices, product, supplier, kinds=(PRICE_NORMAL, PRICE_OFFER)):
     """Most recently checked Prijzen row of one of `kinds` for product + supplier, mapped to the keys price_status
     uses. Default: confirmed kinds only, so an imported open-data row never shadows a confirmed price or offer."""
     best = None
     for p in prices or []:
-        if text(p.get("Prijssoort")) not in kinds:
+        if price_kind(p) not in kinds:
             continue
         if same_name(p.get("Product"), product) and same_name(p.get("Leverancier"), supplier):
             if best is None or (parse_date(p.get("Prijsdatum")) or date.min) > (parse_date(best.get("Prijsdatum")) or date.min):
@@ -383,7 +412,7 @@ def latest_price(prices, product, supplier, kinds=(PRICE_NORMAL, PRICE_OFFER)):
     if best is None:
         return {}
     return {"Prijs/eenheid €": best.get("Prijs/eenheid €"), "Prijs leverancier": best.get("Leverancier"),
-            "Prijssoort": best.get("Prijssoort"), "Geldig t/m": best.get("Geldig t/m"),
+            "Prijssoort": price_kind(best), "Geldig t/m": best.get("Geldig t/m"),
             "Prijsdatum": best.get("Prijsdatum"), "Verpakking": best.get("Verpakking"),
             "Bron": best.get("Bron"), "Prijs verpakking €": best.get("Prijs verpakking €"),
             "Min. aantal": best.get("Min. aantal"), "_price_row": best.get("_row")}
@@ -507,6 +536,11 @@ def shopping_totals(rows, inventory, delivery, today, prices=None):
     stock_ok = bool(rows) and not (missing_stock or missing_inventory)
     delivery_ok = bool(delivery.get("ok"))
     basket = delivery.get("basket") if delivery_ok else None
+    basket_problem = delivery.get("basket_problem") if delivery_ok else None
+    if basket is not None and ready_count > 0 and basket <= 0:
+        basket, basket_problem = None, "mandtotaal €0,00 terwijl er te bestellen regels zijn"
+    elif basket is not None and delivery.get("basket_list") != order_fingerprint(rows):
+        basket, basket_problem = None, "aanvullijst gewijzigd na de checkoutcontrole; mandtotaal opnieuw invullen"
     ready = stock_ok and ready_count > 0 and delivery_ok and basket is not None
     priced_all = stock_ok and not (missing_price or invalid_price)
     return {
@@ -522,7 +556,7 @@ def shopping_totals(rows, inventory, delivery, today, prices=None):
         "missing_price": missing_price,
         "invalid_price": invalid_price,
         "delivery_problems": list(delivery.get("problems") or []),
-        "basket_problem": delivery.get("basket_problem") if delivery_ok else None,
+        "basket_problem": basket_problem,
         "needed_lines": ready_count,
         "archived": archived,
         "lines": lines,
@@ -551,7 +585,7 @@ def go_decision(spend, budget, schema=None):
         reasons.append(f"{len(spend['missing_stock'])} voorraadtelling(en) niet bruikbaar: " + "; ".join(
             f"{n} ({spend['stock_reasons'].get(n, 'onbekend')})" for n in spend["missing_stock"]))
     if spend.get("basket_problem"):
-        reasons.append("Mandtotaal uit de checkout ontbreekt (Bestellen → Bezorging en checkout)")
+        reasons.append(f"Checkout: {spend['basket_problem']} (Bestellen → Bezorging en checkout)")
     if not reasons and spend["needed_lines"] == 0:
         reasons.append("Geen te bestellen regels gevonden (lege of ontbrekende Aanvullijst)")
     if not reasons and spend["grand_total"] is not None and spend["grand_total"] > budget:
@@ -788,10 +822,12 @@ def weeklijst_rows(menu, spend, comparison, saving, go, reasons, delivery, budge
     for issue in inventory_issues:
         rows.append(["Voorraadcorrectie", issue[0], "", "", "", issue[1]])
     for r in comparison:
+        basis = "indicatief" + (f"; {r['open_lines']} regel(s) open data" if r.get("open_lines") else "")
         rows.append(["Supermarktvergelijking", r["supplier"], "", "", "" if r["total"] is None else r["total"],
-                     "compleet" if r["complete"] else "; ".join(r["problems"])])
+                     basis if r["complete"] else "; ".join(r["problems"])])
     for s in saving:
-        rows.append(["Besparing", s["supplier"], "", "", "" if s["difference"] is None else s["difference"], s["advice"]])
+        rows.append(["Besparing", s["supplier"], "", "", "" if s["difference"] is None else s["difference"],
+                     f"{s['advice']} (indicatief)"])
     rows.append(["Bezorgkosten", delivery.get("supplier") or "", "", "",
                  "" if delivery.get("amount") is None else delivery["amount"],
                  "geldig" if delivery.get("ok") else "; ".join(delivery.get("problems") or [])])

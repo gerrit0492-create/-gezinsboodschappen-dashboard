@@ -18,7 +18,8 @@ import scan
 from picker import check_pick, picker_step
 from core import (CHECK_WINDOW_DAYS, DELIVERY_KEYS, MAX_BUDGET, PRICE_NORMAL, PRICE_OFFER, classify_inventory,
                   compare_suppliers, confirmations, delivery_check, effective_budget, expiring, go_decision,
-                  is_active, is_allowed, latest_price, low_stock, open_status, match_barcodes, new_receipt_rows, normalised_price,
+                  confirmed_row, is_active, is_allowed, latest_price, low_stock, open_status, order_fingerprint,
+                  match_barcodes, new_receipt_rows, normalised_price,
                   number, pack_size, pack_to_row_unit_price, parse_date, parse_receipt_lines, savings,
                   schema_problems, settings_map, shopping_totals, stock_state, supplier_rows, table_rows, text,
                   valid_amount, weeklijst_rows)
@@ -403,7 +404,8 @@ with stock_tab:
 
 # --- Bestellen --------------------------------------------------------------------------------------
 with order_tab:
-    st.caption("Afvinken wat in het mandje zit. Bedragen alleen bij een geldige prijs voor de gekozen supermarkt en bezorgdag.")
+    st.caption("Afvinken wat in het mandje zit. ≈ bedragen zijn verwachtingen (bevestigde prijs, aanbieding of actuele "
+               "open data), geen bevestigde bedragen; GO gebruikt het mandtotaal uit de checkout.")
     order_lines = [x for x in shopping if number(x.get("Te bestellen")) is None or number(x.get("Te bestellen")) > 0]
     if order_lines:
         line_info = {ln["product"]: ln for ln in spend["lines"]}
@@ -414,7 +416,8 @@ with order_tab:
                 qty = number(x.get("Te bestellen"))
                 amount = info.get("bedrag")
                 label = (f"{x['Product']} — {'?' if qty is None else f'{qty:g}'} {x.get('Eenheid', '')}"
-                         f" · {'€%.2f' % amount if amount is not None else info.get('opmerking') or 'controle nodig'}")
+                         f" · {'≈ €%.2f %s' % (amount, info.get('opmerking', '').replace('verwacht ', ''))
+                                if amount is not None else info.get('opmerking') or 'controle nodig'}")
                 shown = x.get("In mand") is True or text(x.get("In mand")).lower() in ("true", "waar")
                 # the Sheet value is part of the key: after any refresh the box shows the Sheet again instead of
                 # an old widget state, so saving can never undo a tick made in another session
@@ -465,7 +468,9 @@ with order_tab:
                 if basket_in is None:
                     raise ValueError("Vul het mandtotaal uit de checkout in (boodschappen zonder bezorgkosten)")
                 record = {"amount": valid_amount(ship_in), "verified": today, "supplier": supplier,
-                          "date": ship_date, "source": ship_src, "basket": valid_amount(basket_in)}
+                          "date": ship_date, "source": ship_src, "basket": valid_amount(basket_in),
+                          # the order list the user saw while reading the checkout: a later change makes it stale
+                          "basket_list": order_fingerprint(table_rows(seen_data.get("Aanvullijst", [])))}
                 write_delivery(spreadsheet(), record,
                                {f: (seen_settings.get(k) or {}).get("value") for f, k in DELIVERY_KEYS.items()})
                 saved("Bezorgcontrole opgeslagen" + ("" if record["amount"] == 0 else
@@ -476,7 +481,15 @@ with order_tab:
 # --- Prijzen ----------------------------------------------------------------------------------------
 has_min_column = "Min. aantal" in [text(h) for h in (data.get("Prijzen") or [[]])[0]]
 open_links = open_prices.open_rows(seen_prices)
-price_reference = delivery["date"] if delivery["date"] and delivery["date"] >= today else today
+price_reference = delivery["date"] or today            # same reference as the expected amount (core.line_price)
+
+
+def md(value):
+    """Escape external text (article names from open data) for Markdown/labels."""
+    out = text(value)
+    for ch in "\\`*_[]()#<>|":
+        out = out.replace(ch, "\\" + ch)
+    return out
 
 
 @st.cache_resource(ttl=6 * 3600, max_entries=1, show_spinner=False)
@@ -491,17 +504,26 @@ def open_data(bucket):
     dates = open_prices.measured_dates(
         commits, lambda sha: head_fp if sha == commits[0][0] else open_prices.fingerprint(open_prices.fetch_dataset(sha)))
     keep = [m for m in head if m.get("n") in ("jumbo", "ah", "lidl")]
-    return {"sha": commits[0][0], "dataset": keep, "dates": dates}
+    return {"sha": commits[0][0], "dataset": keep, "dates": dates, "index": open_prices.build_index(keep)}
 
 
-def load_open_data():
+def load_open_data(fetch=False):
+    """Open data for this session. Only fetches when asked (button) or not loaded yet in this session; reruns reuse
+    the last good result, so a network error or a new 6-hour block never makes every click slow."""
+    if not fetch and st.session_state.get("open_data"):
+        return st.session_state["open_data"]
     now = datetime.now(ZoneInfo("Europe/Amsterdam"))
     try:
         with st.spinner("Open data ophalen en meetdatum per supermarkt bepalen (eerste keer per dagdeel ±1 minuut)…"):
-            return open_data(f"{now:%Y-%m-%d}-{now.hour // 6}")
+            od = open_data(f"{now:%Y-%m-%d}-{now.hour // 6}")
+        st.session_state["open_data"] = od
+        return od
     except Exception as exc:
-        st.error(f"Open data niet bereikbaar ({type(exc).__name__}); er is niets gewijzigd. Probeer het later opnieuw.")
-        return None
+        status = getattr(exc, "code", None)
+        why = "GitHub-limiet bereikt (te veel verzoeken vanaf deze server)" if status in (403, 429) else \
+            f"{type(exc).__name__}{f' {status}' if status else ''}"
+        st.error(f"Open data niet bereikbaar: {why}. Er is niets gewijzigd; probeer het later opnieuw.")
+        return st.session_state.get("open_data") if not fetch else None
 
 
 def chain_label(od, chain):
@@ -554,8 +576,7 @@ with price_tab:
                         until = offer_end
                     else:
                         until = delivery["date"]   # a normal price is only proven for this exact day
-                    seen_price = latest_price(seen_prices, item.get("Product"), sup)
-                    snap = next((p for p in seen_prices if p.get("_row") == seen_price.get("_price_row")), None)
+                    snap = confirmed_row(seen_prices, item.get("Product"), sup)   # the row the writer will update
                     write_price(spreadsheet(), text(item["Product"]), sup, pack_price, content, unit, kind, until,
                                 today, source, snap, minimum=(min_qty if kind == PRICE_OFFER else None)
                                 if has_min_column else False)
@@ -571,7 +592,7 @@ with price_tab:
                "gemeten; nooit als bevestigde prijs (GO gebruikt het checkout-totaal).")
     if st.button("🔄 Prijzen bijwerken", type="primary", width="stretch"):
         st.session_state["open_loaded"] = True
-        od = load_open_data()
+        od = load_open_data(fetch=True)
         if od:
             changes, report = open_prices.refresh_changes(open_links, od["dataset"], od["dates"], shopping, inventory)
             try:
@@ -592,11 +613,11 @@ with price_tab:
                 state = open_status(dict(link, Eenheid=unit), price_reference, today)
                 norm = normalised_price(link.get("Prijs/eenheid €"), unit) if number(link.get("Prijs/eenheid €")) else None
                 exact = parse_date(link.get("Geldig t/m")) == parse_date(link.get("Prijsdatum"))
-                st.markdown(f"**{link.get('Product')}** · {link.get('Leverancier')} · "
+                st.markdown(f"**{md(link.get('Product'))}** · {md(link.get('Leverancier'))} · "
                             f"€{number(link.get('Prijs verpakking €')) or 0:.2f} · inhoud {link.get('Verpakking') or 'onbekend'}"
                             f" · {f'€{norm[0]:.2f}/{norm[1]}' if norm else 'eenheidsprijs onbekend'} · gemeten "
                             f"{'' if exact else 'op of vóór '}{link.get('Prijsdatum')} · **{state}** · "
-                            f"[bron]({link.get('Bron')})")
+                            f"[bron](<{text(link.get('Bron'))}>)")
     with st.expander("Artikel koppelen (eenmalig per product en supermarkt)"):
         chains = [n for n in supplier_names if open_prices.chain_of(n)]
         linkable = [x for x in shopping if text(x.get("Product")) and text(x.get("Eenheid"))]
@@ -613,16 +634,16 @@ with price_tab:
                 st.caption(f"{l_sup}: {chain_label(od, chain)}")
                 current = next((x for x in open_links if same(x, l_item["Product"], l_sup)), None)
                 if current:
-                    st.caption(f"Nu gekoppeld: [{current.get('Bron')}]({current.get('Bron')})")
+                    st.caption(f"Nu gekoppeld: <{text(current.get('Bron'))}>")
                 query = st.text_input("Zoeken", value=text(l_item["Product"]), key=f"link_q_{l_item['_row']}_{chain}")
-                found = open_prices.candidates(open_prices.chain_items(od["dataset"], chain), query)
+                found = open_prices.candidates(od["index"][chain], query)
                 if not found:
                     st.info("Geen artikelen gevonden; probeer andere zoekwoorden.")
                 else:
                     def label(c):
                         art, house = c
                         size = open_prices.content_in_row_unit(art.get("s"), art.get("n"), unit)
-                        return (f"{'🏷️ huismerk · ' if house else ''}{art.get('n')} · {art.get('s') or '?'} · "
+                        return (f"{'🏷️ huismerk · ' if house else ''}{md(art.get('n'))} · {md(art.get('s')) or '?'} · "
                                 f"€{number(art.get('p')) or 0:.2f} · {f'{size:g} {unit}' if size else 'inhoud onbekend'}")
                     pick = st.radio("Kies het artikel dat je koopt", found, format_func=label,
                                     key=f"link_pick_{l_item['_row']}_{chain}")
@@ -635,13 +656,14 @@ with price_tab:
                                 raise ValueError("Dit artikel heeft geen prijs in de open data")
                             write_open_prices(spreadsheet(), [{"product": text(l_item["Product"]), "supplier": l_sup,
                                                                "values": values, "seen": current}])
+                            st.session_state.pop("open_report", None)          # old warnings no longer apply
                             saved(f"{l_item['Product']} gekoppeld aan {pick[0].get('n')} ({l_sup})")
                         except Exception as exc:
                             save_failed(exc)
     if open_links and st.session_state.get("open_loaded"):
         with st.expander("Huismerkalternatieven (indicatief)"):
             od = load_open_data()
-            if od:
+            if od and st.button("Huismerken zoeken", width="stretch"):
                 shown = 0
                 for link in open_links:
                     chain = open_prices.chain_of(link.get("Leverancier"))
@@ -649,11 +671,13 @@ with price_tab:
                     mine = number(link.get("Prijs/eenheid €"))
                     if open_prices.HOUSE_PREFIX.get(chain) is None:
                         continue
-                    for alt in open_prices.house_alternatives(od["dataset"], chain, link.get("Product"), unit, limit=1):
+                    for alt in open_prices.house_alternatives(od["dataset"], chain, link.get("Product"), unit, limit=1,
+                                                              index=od["index"]):
                         if alt["url"] == text(link.get("Bron")) or (mine and alt["unit_price"] >= mine):
                             continue
                         norm = normalised_price(alt["unit_price"], unit)
-                        st.markdown(f"**{link.get('Product')}** · {link.get('Leverancier')}: [{alt['name']}]({alt['url']})"
+                        st.markdown(f"**{md(link.get('Product'))}** · {md(link.get('Leverancier'))}: "
+                                    f"[{md(alt['name'])}](<{alt['url']}>)"
                                     f" €{alt['price']:.2f} ({alt['content']:g} {unit}"
                                     + (f", €{norm[0]:.2f}/{norm[1]}" if norm else "") + ")"
                                     + (f" — {(1 - alt['unit_price'] / mine) * 100:.0f}% goedkoper per eenheid" if mine else ""))

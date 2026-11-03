@@ -19,7 +19,8 @@ from __future__ import annotations
 import re
 from decimal import Decimal
 
-from core import (ADDABLE_SETTINGS, APP_COUNT, ARCHIVED, DELIVERY_KEYS, OPEN_DATA, PRICE_NORMAL, PRICE_OFFER, column_letter, is_checked, number,
+from core import (ADDABLE_SETTINGS, APP_COUNT, ARCHIVED, DELIVERY_KEYS, OPEN_DATA, PRICE_NORMAL, PRICE_OFFER, column_letter,
+                  is_open_data, is_checked, number,
                   pack_size, pack_to_row_unit_price, parse_date, receipt_key, text)
 
 TAB_NAMES = ["Overzicht", "Voorraad", "Aanvullijst", "Weekmenu", "Instellingen", "Leveranciers", "Bonnen", "Prijzen",
@@ -190,6 +191,10 @@ def write_basket(book, changes):
     return len(changes)
 
 
+_SETTING_NOTES = {"Mandtotaal checkout": "Boodschappentotaal uit de checkout, zonder bezorgkosten (ingevuld via de app)",
+                  "Mandtotaal voor lijst": "Kenmerk van de aanvullijst bij het mandtotaal (door de app; niet wijzigen)"}
+
+
 def write_delivery(book, record, old):
     """Store a delivery check in Instellingen column B.
 
@@ -204,7 +209,7 @@ def write_delivery(book, record, old):
     basket = number(record.get("basket"))
     if basket is None or basket < 0:
         raise ValueError("Mandtotaal uit de checkout is verplicht en mag niet negatief zijn")
-    for field in ("supplier", "source"):
+    for field in ("supplier", "source", "basket_list"):
         if not text(record.get(field)):
             raise ValueError(f"Veld '{DELIVERY_KEYS[field]}' is verplicht")
     when, verified = parse_date(record.get("date")), parse_date(record.get("verified"))
@@ -228,8 +233,7 @@ def write_delivery(book, record, old):
             keys[key] = new_row
             req.append({"range": f"A{new_row}", "values": [[key]]})
             if explain:
-                req.append({"range": f"C{new_row}", "values": [["Boodschappentotaal uit de checkout, zonder "
-                                                                 "bezorgkosten (ingevuld via de app)"]]})
+                req.append({"range": f"C{new_row}", "values": [[_SETTING_NOTES.get(key, "Ingevuld via de app")]]})
             new_row += 1
             grid = grid + [[key]]
         current = grid[keys[key] - 1]
@@ -441,7 +445,7 @@ def write_price(book, product, supplier, pack_price, pack, unit, kind, valid_thr
     ws = book.worksheet("Prijzen")
     grid, col, headers = _fresh(ws, list(values))
     rows = [i + 1 for i in _price_rows(grid, headers, product, supplier)
-            if text(_cell(grid, headers, i + 1, "Prijssoort")) != OPEN_DATA]    # open-data rows are separate
+            if not is_open_data({"Prijssoort": _cell(grid, headers, i + 1, "Prijssoort")})]   # open data is separate
     if len(rows) > 1:
         raise ConflictError(f"'{product}' bij {supplier} staat meerdere keren in Prijzen; ruim dat eerst op.")
     if rows:
@@ -487,7 +491,7 @@ def write_open_prices(book, changes):
         if not text(values.get("Bron")) or parse_date(values.get("Prijsdatum")) is None:
             raise ValueError(f"Bron en meetdatum zijn verplicht ({c['product']} bij {c['supplier']})")
         rows = [i + 1 for i in _price_rows(grid, headers, c["product"], c["supplier"])
-                if text(_cell(grid, headers, i + 1, "Prijssoort")) == OPEN_DATA]
+                if is_open_data({"Prijssoort": _cell(grid, headers, i + 1, "Prijssoort")})]
         if len(rows) > 1:
             raise ConflictError(f"'{c['product']}' bij {c['supplier']} heeft meerdere open-data-regels in Prijzen; "
                                 "ruim dat eerst op.")

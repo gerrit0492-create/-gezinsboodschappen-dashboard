@@ -24,7 +24,7 @@ import urllib.request
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from core import OPEN_DATA, number, same_name, text
+from core import OPEN_DATA, is_open_data, number, same_name, text
 
 SOURCE_NAME = "Checkjebon open data (MIT)"
 REPO = "supermarkt/checkjebon"
@@ -38,7 +38,12 @@ CHAINS = {"jumbo": "jumbo", "albert heijn": "ah", "ah": "ah", "lidl": "lidl"}
 HOUSE_PREFIX = {"jumbo": "jumbo ", "ah": "ah ", "lidl": None}   # Lidl article names carry no brand in this data
 
 _SIZE = re.compile(r"(\d+(?:[.,]\d+)?)\s*(kg|kilo|gram|gr|g|ml|cl|liter|l|stuks|stuk|st)\b", re.I)
-_MULTI = re.compile(r"(\d+)\s*[x×]\s*(\d+(?:[.,]\d+)?)\s*(kg|kilo|gram|gr|g|ml|cl|liter|l)\b", re.I)
+_MULTI = re.compile(r"(\d+)\s*[x×]\s*(\d+(?:[.,]\d+)?)\s*(kg|kilo|gram|gr|g|ml|cl|liter|l|stuks|stuk|st)\b", re.I)
+_THOUSANDS = re.compile(r"(?<![\d.,])(\d{1,3})\.(\d{3})(?![\d,])")       # '1.000 g' -> '1000 g'
+
+
+def _sizes(raw):
+    return _THOUSANDS.sub(r"\1\2", text(raw))
 _BASE = {"kg": ("g", 1000), "kilo": ("g", 1000), "gram": ("g", 1), "gr": ("g", 1), "g": ("g", 1),
          "ml": ("ml", 1), "cl": ("ml", 10), "liter": ("ml", 1000), "l": ("ml", 1000),
          "stuks": ("st", 1), "stuk": ("st", 1), "st": ("st", 1)}
@@ -78,7 +83,7 @@ def parse_size(size, name=""):
     """(amount, base unit) with base unit g / ml / st, from the size field or else the name; None if unknown.
     '3 x 400 g' -> (1200, 'g'); '0,75 l' -> (750, 'ml'); '6 stuks' -> (6, 'st')."""
     for raw in (size, name):
-        raw = text(raw)
+        raw = _sizes(raw)
         m = _MULTI.search(raw)
         if m:
             base, factor = _BASE[m.group(3).lower()]
@@ -93,8 +98,8 @@ def parse_size(size, name=""):
 def content_in_row_unit(size, name, row_unit):
     """Pack content expressed in the Sheet row unit, or None when it cannot be derived exactly.
 
-    Weight/volume/count row units are converted. For pack-type row units (blikken, broden, bakjes, ...) one article
-    is one pack, unless the article is a multipack ('3 x 400 g' / '4 stuks')."""
+    Weight/volume/count row units are converted. For pack-type row units (blikken, broden, bakjes, doos, ...) one
+    article is one pack (a box of '10 stuks' eggs is 1 doos), unless the article is a multipack ('3 x 400 g')."""
     parsed = parse_size(size, name)
     unit = text(row_unit).lower()
     if unit in _ROW:
@@ -103,25 +108,30 @@ def content_in_row_unit(size, name, row_unit):
         return round(parsed[0] / _ROW[unit][1], 6)
     if not unit:
         return None
-    m = _MULTI.search(f"{text(size)} {text(name)}")
+    m = _MULTI.search(f"{_sizes(size)} {_sizes(name)}")
     if m:
         return float(int(m.group(1)))
-    if parsed and parsed[1] == "st":
-        return parsed[0]
     return 1.0
 
 
-def candidates(items, query, limit=8):
-    """Best-matching articles for a search text. Ranking: all words of an alternative present, then house brand,
-    then shorter names (fewer extras), then price. Returns [(article, house_brand)]."""
+def chain_index(dataset, chain):
+    """[(normalised name, article, house brand)] for one chain, computed once per dataset (see build_index)."""
+    return [(_norm(a.get("n")), a, is_house_brand(chain, a.get("n"))) for _, a in chain_items(dataset, chain)]
+
+
+def build_index(dataset, chains=("jumbo", "ah", "lidl")):
+    return {c: chain_index(dataset, c) for c in chains}
+
+
+def candidates(entries, query, limit=8):
+    """Best-matching articles for a search text in chain_index entries. Ranking: all words of an alternative
+    present, then house brand, then shorter names (fewer extras), then price. Returns [(article, house_brand)]."""
     alts = search_terms(query)
     if not alts:
         return []
     scored = []
-    for chain, art in items:
-        name = _norm(art.get("n"))
+    for name, art, house in entries:
         if any(all(w in name for w in alt) for alt in alts):
-            house = is_house_brand(chain, art.get("n"))
             scored.append(((0 if house else 1, len(name), number(art.get("p")) or 0), art, house))
     scored.sort(key=lambda s: s[0])
     return [(a, h) for _, a, h in scored[:limit]]
@@ -167,12 +177,13 @@ def price_values(article, url, row_unit, measured, exact=True):
             "Bron": url}
 
 
-def house_alternatives(dataset, chain, query, row_unit, limit=3):
+def house_alternatives(dataset, chain, query, row_unit, limit=3, index=None):
     """Cheapest house-brand articles (by price per row unit) for a product; [] when house brand is unknown."""
     if HOUSE_PREFIX.get(chain) is None:
         return []
+    entries = (index or {}).get(chain) or chain_index(dataset, chain)
     out = []
-    for art, house in candidates(chain_items(dataset, chain), query, limit=10_000):
+    for art, house in candidates([e for e in entries if e[2]], query, limit=10_000):
         content = content_in_row_unit(art.get("s"), art.get("n"), row_unit) if house else None
         price = number(art.get("p"))
         if content and price:
@@ -198,7 +209,8 @@ def measured_dates(commits, fingerprint_at, chains=("jumbo", "ah", "lidl")):
 
     Gallop back from the newest commit (1, 2, 4, ... steps) until the chain's data differs, then bisect between the
     last identical and the first different commit. exact=False: identical in every listed commit (real date older).
-    Assumes a chain's data never returns to an earlier identical state (true for real price lists)."""
+    Assumes a chain's data never returns to an earlier identical state (true for real price lists). A version in which
+    the chain is missing counts as 'identical' (conservative: the date can only get older, never fresher)."""
     cache = {}
 
     def fp(i):
@@ -213,10 +225,11 @@ def measured_dates(commits, fingerprint_at, chains=("jumbo", "ah", "lidl")):
     for chain in chains:
         if chain not in head:
             continue
+        unchanged = lambda i: fp(i).get(chain) in (head[chain], None)    # noqa: E731
         same, step, diff = 0, 1, None
         while True:
             probe = min(same + step, len(commits) - 1)
-            if fp(probe).get(chain) == head[chain]:
+            if unchanged(probe):
                 same = probe
                 if probe == len(commits) - 1:
                     break
@@ -229,7 +242,7 @@ def measured_dates(commits, fingerprint_at, chains=("jumbo", "ah", "lidl")):
             continue
         while diff - same > 1:
             mid = (same + diff) // 2
-            if fp(mid).get(chain) == head[chain]:
+            if unchanged(mid):
                 same = mid
             else:
                 diff = mid
@@ -264,7 +277,7 @@ def fetch_dataset(sha, get=_get):
 
 
 def open_rows(prices):
-    return [p for p in prices or [] if same_name(p.get("Prijssoort"), OPEN_DATA)]
+    return [p for p in prices or [] if is_open_data(p)]
 
 
 def row_unit_of(product, shopping, inventory):
@@ -274,6 +287,9 @@ def row_unit_of(product, shopping, inventory):
             if same_name(x.get("Product"), product) and text(x.get("Eenheid")):
                 return text(x.get("Eenheid"))
     return ""
+
+
+_NUMERIC = ("Prijs verpakking €", "Prijs/eenheid €")
 
 
 def refresh_changes(links, dataset, dates, shopping, inventory):
@@ -297,7 +313,8 @@ def refresh_changes(links, dataset, dates, shopping, inventory):
         if values is None:
             report.append(f"{product} bij {supplier}: geen prijs in de open data")
             continue
-        if all(text(values[h]) == text(link.get(h)) for h in values if h != "Prijssoort"):
+        if all((number(values[h]) == number(link.get(h))) if h in _NUMERIC else text(values[h]) == text(link.get(h))
+               for h in values if h != "Prijssoort"):
             continue          # nothing changed (same measurement): no write
         changes.append({"product": product, "supplier": supplier, "values": values, "seen": link})
     return changes, report

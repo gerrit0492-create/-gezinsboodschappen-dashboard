@@ -6,7 +6,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from core import (MAX_BUDGET, classify_inventory, column_letter, confirmations, delivery_check, delta_changes,
-                  effective_budget, go_decision, is_checked, is_uncertain, line_cost, normalised_price, number,
+                  effective_budget, go_decision, is_checked, is_uncertain, line_cost, normalised_price, number, order_fingerprint,
                   pack_size, pack_to_row_unit_price, parse_date, price_entry_unit, price_status, schema_problems,
                   settings_map, shopping_totals, stock_state, table_rows, to_row_unit_price, valid_amount)
 
@@ -39,6 +39,8 @@ def evaluate(rows=None, inventory=None, delivery_settings=None, budget=150):
     rows = [line()] if rows is None else rows
     inventory = [stock()] if inventory is None else inventory
     delivery = delivery_check(delivery_settings or settings(), TODAY)
+    if delivery.get("basket_list") == "":       # default: the checkout total was read for exactly these rows
+        delivery["basket_list"] = order_fingerprint(rows)
     spend = shopping_totals(rows, inventory, delivery, TODAY)
     return spend, go_decision(spend, effective_budget(budget))
 
@@ -161,12 +163,12 @@ def test_verified_free_delivery_gives_go():
     assert spend["expected_total"] == 6.25 and spend["lines"][0]["opmerking"] == "verwacht (bevestigd)"
 
 
-@pytest.mark.parametrize("basket,go_expected", [("", False), ("abc", False), (-1, False), (0, True), ("€ 143,75", True)])
+@pytest.mark.parametrize("basket,go_expected", [("", False), ("abc", False), (-1, False), (0, False), ("€ 143,75", True)])
 def test_go_needs_checkout_basket_total(basket, go_expected):
     spend, (go, reasons) = evaluate(delivery_settings=settings(**{"Mandtotaal checkout": basket}))
     assert go is go_expected
     if not go_expected:
-        assert spend["grand_total"] is None and any("Mandtotaal" in r for r in reasons)
+        assert spend["grand_total"] is None and any("mandtotaal" in r.lower() for r in reasons)
 
 
 def test_slot_is_no_longer_required():
@@ -372,3 +374,24 @@ def test_renamed_weekdoel_column_is_reported():
 def settings_rows():
     return [["Instelling", "Waarde"]] + [[k, ""] for k in ("Weekbudget", "Werkelijke bezorgkosten",
             "Bezorgkosten gecontroleerd op", "Bezorging leverancier", "Bezorgdatum", "Bezorgkosten bron")]
+
+
+def test_checkout_total_goes_stale_when_order_list_changes_or_is_zero():
+    base = settings(**{"Mandtotaal voor lijst": order_fingerprint([line()])})
+    assert evaluate(delivery_settings=base)[1][0] is True
+    spend, (go, reasons) = evaluate(rows=[line(wanted=1000)], inventory=[stock()], delivery_settings=base)
+    assert go is False and spend["grand_total"] is None and any("aanvullijst gewijzigd" in r for r in reasons)
+    spend, (go, reasons) = evaluate(delivery_settings=settings(**{"Mandtotaal checkout": 0}))
+    assert go is False and any("€0,00" in r and "te bestellen" in r for r in reasons)
+    assert order_fingerprint([line(), line(product="Melk", wanted=0)]) == order_fingerprint([line()])
+
+
+def test_price_kind_is_case_insensitive_and_confirmed_row_matches_writer():
+    from core import confirmed_row, latest_price, price_kind
+    rows = [dict(line(kind="normaal"), Leverancier="Jumbo", _row=2),
+            {"Product": "Kaas", "Leverancier": "Jumbo", "Prijssoort": "open data", "_row": 3}]
+    assert price_kind(rows[0]) == "Normaal" and price_kind(rows[1]) == "Open data"
+    assert latest_price(rows, "Kaas", "Jumbo")["Prijssoort"] == "Normaal"
+    assert confirmed_row(rows, "Kaas", "Jumbo")["_row"] == 2
+    legacy = [dict(rows[0], Prijssoort="")]                       # blank kind: still the row the writer updates
+    assert confirmed_row(legacy, "Kaas", "Jumbo")["_row"] == 2 and latest_price(legacy, "Kaas", "Jumbo") == {}

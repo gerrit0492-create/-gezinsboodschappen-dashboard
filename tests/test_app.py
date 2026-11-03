@@ -242,7 +242,8 @@ def test_full_flow_reaches_go_and_writes_only_target_cells(monkeypatch):
     assert book.tabs["Aanvullijst"].writes == []                         # formulas E/F/H untouched
     inst = book.tabs["Instellingen"]
     assert inst.grid[9][:2] == ["Mandtotaal checkout", 6.25]              # missing key row added once, below the data
-    assert all(r.startswith("B") for r in inst.writes if r not in ("A10", "C10"))
+    assert inst.grid[10][0] == "Mandtotaal voor lijst" and len(inst.grid[10][1]) == 12   # order-list fingerprint
+    assert all(r.startswith("B") for r in inst.writes if r not in ("A10", "C10", "A11", "C11"))
     assert inst.grid[8][0] == "Bezorgkosten bron" and inst.grid[7] == ["Bezorgmoment", "", ""]   # old row untouched
 
 
@@ -571,3 +572,25 @@ def test_link_article_once_then_current_open_price_feeds_expected_amount(monkeyp
     assert any(m.value == "€7.10" for m in at.metric if m.label.startswith("Totaal checkout"))   # GO = checkout
     assert go_shown(at)
     assert len(set(fetched)) == len(fetched) < 12                    # each version downloaded once, then cached
+
+
+def test_go_drops_when_order_list_changes_after_checkout(monkeypatch):
+    book = make_book()
+    at, _ = start(monkeypatch, book)
+    count_kaas(at)
+    save_delivery(at, 0.0)
+    assert go_shown(at)
+    other_session_changes(book, "Aanvullijst", 2, 5, 800)            # 'Te bestellen' rises after the checkout
+    book.tabs["Aanvullijst"].grid[1][2] = 800                         # (Weekdoel too, so stock stays consistent)
+    at.run()
+    assert not go_shown(at) and any("aanvullijst gewijzigd" in w.value for w in at.warning)
+
+
+def test_basket_label_marks_expected_amounts(monkeypatch):
+    book = make_book()
+    at, _ = start(monkeypatch, book)
+    count_kaas(at)
+    save_delivery(at, 0.0)
+    save_price(at, 6.25, 500.0)
+    label = next(c.label for c in at.checkbox if c.label.startswith("Kaas —"))
+    assert "≈ €6.25 (bevestigd)" in label

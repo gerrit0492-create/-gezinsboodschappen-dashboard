@@ -33,9 +33,9 @@ INSTELLINGEN = [
 ]
 PRIJZEN = [["Product", "Leverancier", "Prijs verpakking €", "Verpakking", "Prijs/eenheid €", "Prijssoort",
             "Geldig t/m", "Prijsdatum", "Bron"]]
-EMPTY_OLD = {"amount": "", "verified": "", "supplier": "", "date": "", "source": "", "basket": ""}
+EMPTY_OLD = {"amount": "", "verified": "", "supplier": "", "date": "", "source": "", "basket": "", "basket_list": ""}
 RECORD = {"amount": 0.0, "verified": TODAY, "supplier": "Jumbo", "date": date(2026, 11, 6),
-          "source": "checkout-scherm", "basket": 123.456}
+          "source": "checkout-scherm", "basket": 123.456, "basket_list": "abc123def456"}
 
 
 class FakeSheet:
@@ -137,16 +137,17 @@ def test_delivery_write_fills_only_value_cells():
     # once in the first empty row below the data (A9 + note C9), its value on 2 decimals
     assert got == {"B3": [0.0], "B4": ["2026-11-05"], "B5": ["Jumbo"], "B6": ["2026-11-06"],
                    "B8": ["checkout-scherm"], "A9": ["Mandtotaal checkout"], "B9": [123.46],
-                   "C9": [got["C9"][0]]}
-    assert "zonder bezorgkosten" in got["C9"][0]
+                   "C9": [got["C9"][0]], "A10": ["Mandtotaal voor lijst"], "B10": ["abc123def456"],
+                   "C10": [got["C10"][0]]}
+    assert "zonder bezorgkosten" in got["C9"][0] and "niet wijzigen" in got["C10"][0]
 
 
 def test_delivery_updates_existing_basket_row_in_place():
-    grid = [list(r) for r in INSTELLINGEN] + [["Mandtotaal checkout", 99.0, ""]]
+    grid = [list(r) for r in INSTELLINGEN] + [["Mandtotaal checkout", 99.0, ""], ["Mandtotaal voor lijst", "old", ""]]
     ws = FakeSheet(grid)
-    write_delivery(FakeBook(Instellingen=ws), RECORD, dict(EMPTY_OLD, basket=99.0))
+    write_delivery(FakeBook(Instellingen=ws), RECORD, dict(EMPTY_OLD, basket=99.0, basket_list="old"))
     got = ranges(ws)
-    assert got["B9"] == [123.46] and not any(r.startswith(("A", "C")) for r in got)
+    assert got["B9"] == [123.46] and got["B10"] == ["abc123def456"] and not any(r.startswith(("A", "C")) for r in got)
 
 
 def test_delivery_refuses_when_basket_row_appeared_or_vanished():
@@ -167,7 +168,7 @@ def test_delivery_never_adds_required_rows():
     assert ws.updates == []
 
 
-@pytest.mark.parametrize("over", [{"amount": -1}, {"amount": None}, {"supplier": ""}, {"basket": None},
+@pytest.mark.parametrize("over", [{"amount": -1}, {"amount": None}, {"supplier": ""}, {"basket": None}, {"basket_list": ""},
                                   {"basket": -1}, {"source": ""},
                                   {"date": None}, {"verified": date(2026, 11, 7)}])
 def test_delivery_rejects_invalid_input(over):

@@ -45,13 +45,15 @@ def test_parse_size(size, name, expected):
     ("250 g", "", "gram", 250), ("250 g", "", "kg", 0.25), ("1 l", "", "liter", 1), ("1 l", "", "gram", None),
     ("6 stuks", "", "stuks", 6), ("400 g", "Kidneybonen", "blikken", 1), ("", "Tomatenblokjes 3 x 400 g", "blikken", 3),
     ("", "Kaas plakken", "gram", None), ("400 g", "", "", None),
+    ("", "Eieren 10 stuks", "doos", 1), ("1.000 g", "", "gram", 1000), ("4 x 1 stuks", "", "stuks", 4),
+    ("", "Jumbo Tomaten 3 x 400 g", "blikken", 3),
 ])
 def test_content_in_row_unit(size, name, unit, expected):
     assert op.content_in_row_unit(size, name, unit) == expected
 
 
 def test_candidates_rank_house_brand_first_and_handle_alternatives():
-    items = op.chain_items(DATA, "jumbo")
+    items = op.chain_index(DATA, "jumbo")
     found = op.candidates(items, "Jonge kaas plakken / smeerkaas")
     assert [a["l"] for a, _ in found] == ["kaas-3", "kaas-1"]          # 'jonge' needs all words of one alternative
     found = op.candidates(items, "kaas plakken")
@@ -250,3 +252,14 @@ def test_manual_price_ignores_open_row_and_writes_min_quantity_only_when_column_
     with pytest.raises(ValueError):
         write_price(FakeBook(Prijzen=FakeSheet(with_min)), "Kaas", "Jumbo", 5.99, 500, "gram", "Aanbieding", DAY,
                     TODAY, "webshop", table_rows(with_min)[0], minimum=0)
+
+
+def test_missing_chain_in_older_version_never_makes_data_look_fresher():
+    commits = [(f"c{i}", date(2026, 11, 3).fromordinal(date(2026, 11, 3).toordinal() - i)) for i in range(20)]
+
+    def fp(sha):
+        i = int(sha[1:])
+        if i in (1, 2, 3):
+            return {"ah": "A0"}                       # Jumbo missing (scraper failed) in these versions
+        return {"jumbo": "J0" if i < 10 else f"J{i}", "ah": "A0"}
+    assert op.measured_dates(commits, fp)["jumbo"] == (commits[9][1], True)

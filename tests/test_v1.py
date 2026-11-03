@@ -10,7 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import scan  # noqa: E402
 from core import (compare_suppliers, delivery_check, expiring, go_decision, is_allowed, low_stock,  # noqa: E402
                   match_barcodes, new_receipt_rows, parse_receipt_lines, savings, settings_map, shopping_totals,
-                  supplier_rows, weeklijst_rows, effective_budget)
+                  supplier_rows, weeklijst_rows, effective_budget, order_fingerprint)
 
 TODAY = date(2026, 11, 5)
 DAY = date(2026, 11, 6)
@@ -19,7 +19,7 @@ DAY = date(2026, 11, 6)
 def settings(supplier="Jumbo", amount=0, basket=8.20):
     rows = {"Weekbudget": 150, "Werkelijke bezorgkosten": amount, "Bezorgkosten gecontroleerd op": "2026-11-05",
             "Bezorging leverancier": supplier, "Bezorgdatum": "2026-11-06", "Bezorgkosten bron": "checkout",
-            "Mandtotaal checkout": basket}
+            "Mandtotaal checkout": basket, "Mandtotaal voor lijst": order_fingerprint(ROWS)}
     return settings_map([["Instelling", "Waarde"]] + [[k, v] for k, v in rows.items()])
 
 
@@ -219,6 +219,7 @@ def test_weeklijst_contains_all_sections():
     assert rows[0][1] == "GO" and all(len(r) == 6 for r in rows)
     total = next(r for r in rows if r[0] == "Totaal")
     assert total[4] == 8.20 and "141.80" in total[5]
+    assert all("indicatief" in r[5] for r in rows if r[0] in ("Supermarktvergelijking", "Besparing") and r[4] != "")
     expected = next(r for r in rows if r[0] == "Verwacht")
     assert expected[4] == 8.25 and "geen bevestigd bedrag" in expected[5]
 
