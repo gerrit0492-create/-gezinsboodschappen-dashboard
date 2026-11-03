@@ -40,9 +40,11 @@ Deze repository bevat **alleen applicatiecode**. Alle gegevens (voorraad, prijze
   t.o.v. andere supermarkten, bijna-op, houdbaarheid, weekmenu en een knop om tab `Weeklijst` bij te werken.
 - **Voorraad**: tellen wat nodig is, per product telling/locatie/houdbaarheid, "opgebruikt" (= bevestigde 0),
   archiveren met bevestiging (niets wordt verwijderd), product toevoegen.
-- **Bestellen**: afvinkbare boodschappenlijst en de bezorgcontrole (leverancier, datum, tijdvak, bron, bedrag).
-- **Prijzen**: prijs per verpakking + inhoud per supermarkt met bron en datum; omrekening naar €/kg, €/liter of
-  €/stuk; vergelijking van hetzelfde mandje (hele verpakkingen) incl. bezorg- en reis-/tijdkosten.
+- **Bestellen**: afvinkbare boodschappenlijst en de checkoutcontrole (leverancier, bezorgdatum, mandtotaal,
+  bezorgkosten, bron).
+- **Prijzen**: knop **Prijzen bijwerken** (gratis open data, zie hieronder), eenmalig artikel koppelen per product en
+  supermarkt, huismerkalternatieven, handmatige prijs/aanbieding met bron en datum; omrekening naar €/kg, €/liter of
+  €/stuk; indicatieve vergelijking van hetzelfde mandje (hele verpakkingen) incl. bezorg- en reis-/tijdkosten.
 - **Menu**: diner per dag aanpasbaar (tab `Weekmenu`).
 - **Scan**: gratis streepjescode-scan (één of meer EAN/UPC-codes per foto, lokaal gelezen met zxing-cpp), met een
   naamsuggestie van Open Food Facts. Geen herkenning zonder barcode en geen schatting van hoeveelheden: aantallen
@@ -53,13 +55,34 @@ Deze repository bevat **alleen applicatiecode**. Alle gegevens (voorraad, prijze
 
 GO alleen als alles klopt; anders NO-GO met de redenen. "Bestelweek" = de 6 dagen vóór de bezorgdatum t/m vandaag.
 
-- Bezorgcontrole met leverancier, bezorgdatum, tijdvak, bron en controledatum in de bestelweek, en bezorgkosten
-  **exact €0,00**.
+- Checkoutcontrole met leverancier, bezorgdatum, bron en controledatum in de bestelweek, bezorgkosten
+  **exact €0,00** en het **mandtotaal uit de checkout** (daar zijn aanbiedingen en minimumaantallen al verrekend).
 - Elk te bestellen product staat in `Voorraad` en elke actieve regel ervan is bevestigd geteld in de bestelweek
   (een foto is nooit een telling). Een getelde 0 is geldig; onbekend nooit. Eenheden en hoeveelheden kloppen.
-- Elke prijs komt uit `Prijzen` van dezelfde leverancier, is in de bestelweek gecontroleerd en geldt op de
-  bezorgdatum (normale prijs: exact die dag; aanbieding: einddatum ≥ bezorgdatum).
-- Totaal (hele verpakkingen, centen) incl. bezorging ≤ min(`Weekbudget`, €150,00).
+- Mandtotaal + bezorgkosten ≤ min(`Weekbudget`, €150,00).
+
+Het **verwachte bedrag** en de supermarktvergelijking zijn indicatief en tellen nooit voor GO. Per regel: een
+bevestigde prijs die op de bezorgdatum geldt (normale prijs: exact die dag; aanbieding: einddatum ≥ bezorgdatum en
+minimumaantal gehaald), anders een **actuele** open-dataprijs. Verouderde of ongedateerde prijzen tellen nooit mee.
+
+## Prijzen bijwerken (gratis open data)
+
+Bron: [Checkjebon open data](https://github.com/supermarkt/checkjebon) (MIT-licentie), zonder sleutel of account.
+De dataset bevat per supermarkt naam, artikel-id, schapprijs en (meestal) inhoud; **geen EAN, geen aanbiedingen en
+geen minimumaantallen**. Daarom:
+
+- Je koppelt per product en supermarkt **één keer** het artikel dat je koopt (zoeken, huismerk bovenaan). De koppeling
+  staat als regel met `Prijssoort` = `Open data` in `Prijzen` (`Bron` = artikel-URL); bevestigde regels
+  (`Normaal`/`Aanbieding`) worden nooit aangeraakt. Daarna werkt **Prijzen bijwerken** exact op dat artikel.
+- **Meetdatum** = de dag waarop de prijzen van die supermarkt in de dataset het laatst veranderden (niet de
+  publicatiedatum: het bestand wordt dagelijks opnieuw gepubliceerd, ook als een supermarkt niet opnieuw is gemeten).
+  Is de echte datum ouder dan de opvraagbare geschiedenis, dan blijft `Geldig t/m` leeg en geldt de prijs als
+  verouderd. Alleen een meetdatum binnen de bestelweek telt als *actueel*.
+- Aanbiedingen en minimumaantallen voer je handmatig in (`Aanbieding` met einddatum; optionele kolom `Min. aantal`
+  in `Prijzen`, die de app gebruikt als hij bestaat maar nooit zelf toevoegt).
+- Lidl-gegevens komen via boodschaapje.nl; huismerk is daar niet herkenbaar en de inhoud ontbreekt vaak.
+- Het eerste bijwerken per dagdeel downloadt enkele versies van de dataset om de meetdatum te bepalen (±1 minuut);
+  daarna komt het uit de cache. Is GitHub niet bereikbaar (bijv. limiet), dan wordt niets gewijzigd.
 
 ## Verwacht Sheet-schema
 
@@ -69,10 +92,10 @@ De app voegt zelf geen kolommen of tabbladen toe; ontbreekt iets, dan meldt de a
 |---|---|
 | `Voorraad` | `Product`, `Locatie`, `Aantal nu`, `Eenheid`, `Minimum`, `Zekerheid`, `Laatst gezien`, `Bron`, `Houdbaar tot`, `Status`, `EAN` |
 | `Aanvullijst` | `Product`, `Eenheid`, `Weekdoel`, `Voorraad nu`, `Te bestellen`, `In mand` |
-| `Prijzen` | `Product`, `Leverancier`, `Prijs verpakking €`, `Verpakking`, `Prijs/eenheid €`, `Prijssoort`, `Geldig t/m`, `Prijsdatum`, `Bron` |
+| `Prijzen` | `Product`, `Leverancier`, `Prijs verpakking €`, `Verpakking`, `Prijs/eenheid €`, `Prijssoort`, `Geldig t/m`, `Prijsdatum`, `Bron` (optioneel `Min. aantal`) |
 | `Leveranciers` | `LEVERANCIERS`, `Koopwijze`, `Bezorgkosten gecontroleerd €`, `Bezorging gecontroleerd op`, `Reis- en tijdkosten €` |
 | `Bonnen` | `Besteldatum`, `Leverancier`, `Product`, `Aantal`, `Eenheid`, `Betaald €`, `Bestelnummer`, `Status`, `Verwerkt op` |
-| `Instellingen` | kolom A/B: `Weekbudget`, `Werkelijke bezorgkosten`, `Bezorgkosten gecontroleerd op`, `Bezorging leverancier`, `Bezorgdatum`, `Bezorgmoment`, `Bezorgkosten bron` |
+| `Instellingen` | kolom A/B: `Weekbudget`, `Werkelijke bezorgkosten`, `Bezorgkosten gecontroleerd op`, `Bezorging leverancier`, `Bezorgdatum`, `Bezorgkosten bron` (de app voegt `Mandtotaal checkout` zelf onderaan toe; een oude regel `Bezorgmoment` wordt genegeerd) |
 | `Weekmenu` | `Dag`, `Ritme`, `Diner` (optioneel `Gebruik voorraad eerst`) |
 | `Weeklijst` | `Onderdeel`, `Item`, `Aantal`, `Eenheid`, `Bedrag €`, `Opmerking` (wordt door de app gevuld) |
 

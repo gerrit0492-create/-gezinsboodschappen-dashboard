@@ -16,10 +16,10 @@ TODAY = date(2026, 11, 5)
 DAY = date(2026, 11, 6)
 
 
-def settings(supplier="Jumbo", amount=0):
+def settings(supplier="Jumbo", amount=0, basket=8.20):
     rows = {"Weekbudget": 150, "Werkelijke bezorgkosten": amount, "Bezorgkosten gecontroleerd op": "2026-11-05",
-            "Bezorging leverancier": supplier, "Bezorgdatum": "2026-11-06", "Bezorgmoment": "18-20",
-            "Bezorgkosten bron": "checkout"}
+            "Bezorging leverancier": supplier, "Bezorgdatum": "2026-11-06", "Bezorgkosten bron": "checkout",
+            "Mandtotaal checkout": basket}
     return settings_map([["Instelling", "Waarde"]] + [[k, v] for k, v in rows.items()])
 
 
@@ -59,17 +59,18 @@ def test_supplier_rows_stop_at_first_empty_row():
 
 def test_prices_come_from_prijzen_for_delivery_supplier():
     spend = shopping_totals(ROWS, INV, delivery_check(settings(), TODAY), TODAY, PRICES)
-    assert spend["ready"] and spend["grand_total"] == 8.25          # 6.25 + 2 x 1.00
+    assert spend["expected_total"] == 8.25                           # 6.25 + 2 x 1.00 (indicative)
+    assert spend["ready"] and spend["grand_total"] == 8.20           # GO total = checkout basket + €0 delivery
     other = shopping_totals(ROWS, INV, delivery_check(settings("Lidl"), TODAY), TODAY, PRICES)
-    assert other["grand_total"] == 5.70                              # 4.00 + 2 x 0.85
+    assert other["expected_total"] == 5.70                           # 4.00 + 2 x 0.85
     none = shopping_totals(ROWS, INV, delivery_check(settings(), TODAY), TODAY, [])
-    assert none["ready"] is False and set(none["missing_price"]) == {"Kaas", "Melk"}
+    assert none["expected_total"] is None and set(none["missing_price"]) == {"Kaas", "Melk"}
 
 
 def test_latest_check_wins_when_supplier_has_several_rows():
     old = price("Kaas", "Jumbo", 0.02, 500, checked="2026-11-01", until="2026-11-01")
     spend = shopping_totals(ROWS, INV, delivery_check(settings(), TODAY), TODAY, PRICES + [old])
-    assert spend["grand_total"] == 8.25
+    assert spend["expected_total"] == 8.25
 
 
 def test_comparison_and_savings_same_scope():
@@ -113,7 +114,8 @@ def test_comparison_incomplete_without_proof():
 def test_archived_product_is_not_ordered_and_not_blocking():
     inv = [stock("Kaas", status="Gearchiveerd"), INV[1]]
     spend = shopping_totals(ROWS, inv, delivery_check(settings(), TODAY), TODAY, PRICES)
-    assert spend["archived"] == ["Kaas"] and spend["missing_inventory"] == [] and spend["grand_total"] == 2.0
+    assert spend["archived"] == ["Kaas"] and spend["missing_inventory"] == [] and spend["expected_total"] == 2.0
+    assert spend["ready"]
 
 
 def test_low_stock_and_expiry():
@@ -216,7 +218,9 @@ def test_weeklijst_contains_all_sections():
             "Bezorgkosten", "Totaal"} <= sections
     assert rows[0][1] == "GO" and all(len(r) == 6 for r in rows)
     total = next(r for r in rows if r[0] == "Totaal")
-    assert total[4] == 8.25 and "141.75" in total[5]
+    assert total[4] == 8.20 and "141.80" in total[5]
+    expected = next(r for r in rows if r[0] == "Verwacht")
+    assert expected[4] == 8.25 and "geen bevestigd bedrag" in expected[5]
 
 
 def test_ean_normalisation_matches_upc_and_numeric_cells():

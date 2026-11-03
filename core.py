@@ -3,16 +3,19 @@
 Missing stock and missing prices are unknown, *not* zero. No service calls here.
 
 GO rule (all must hold, otherwise NO-GO):
-- a verified delivery check: supplier, delivery date (today or later), time slot,
-  source and verification date, with delivery costs of exactly EUR 0.00;
+- a verified delivery check: supplier, delivery date (today or later), source and
+  verification date, with delivery costs of exactly EUR 0.00, plus the basket total
+  read from that supplier's checkout (the checkout applies offers and minimum quantities);
 - every product to order exists in Voorraad; every Voorraad row of it holds a
   confirmed physical count from the order week (a confirmed 0 is fine;
   blank/unknown/missing/photo never counts), in the same unit as Aanvullijst,
   matching 'Voorraad nu', and 'Te bestellen' covers Weekdoel - count;
-- every needed line has a price from that same supplier, checked in the order
-  week, for the current unit and pack size, valid on the delivery date (normal
-  price checked for exactly that date, or an offer running until at least then);
-- the total (whole packs, cents) including delivery is within min(Weekbudget, EUR 150.00).
+- checkout basket total + delivery costs is within min(Weekbudget, EUR 150.00).
+
+Line prices only give the EXPECTED amount and the supplier comparison (indicative): a confirmed price valid on the
+delivery date (normal price checked for exactly that date, or an offer running until at least then and whose
+minimum quantity is met) first, else a current open-data price (measured within the order week). Outdated or
+undated prices are never used.
 
 "Order week" = the 6 days before the delivery date up to today (CHECK_WINDOW_DAYS).
 """
@@ -31,6 +34,7 @@ APP_COUNT = "Telling app"         # Voorraad 'Bron' for a physical count confirm
 PHYSICAL_SOURCES = {"gebruiker", APP_COUNT.casefold()}   # only these 'Bron' values are real counts
 PRICE_NORMAL = "Normaal"
 PRICE_OFFER = "Aanbieding"
+OPEN_DATA = "Open data"           # Prijssoort of an imported open-data price: indicative, never confirmed
 
 # Sheet schema the app relies on. The app never adds columns or rows itself.
 REQUIRED_HEADERS = {
@@ -54,10 +58,11 @@ DELIVERY_KEYS = {
     "verified": "Bezorgkosten gecontroleerd op",
     "supplier": "Bezorging leverancier",
     "date": "Bezorgdatum",
-    "slot": "Bezorgmoment",
     "source": "Bezorgkosten bron",
+    "basket": "Mandtotaal checkout",
 }
-REQUIRED_SETTINGS = ["Weekbudget"] + list(DELIVERY_KEYS.values())
+ADDABLE_SETTINGS = {"Mandtotaal checkout"}   # write_delivery adds this key row itself when it is missing
+REQUIRED_SETTINGS = ["Weekbudget"] + [k for k in DELIVERY_KEYS.values() if k not in ADDABLE_SETTINGS]
 
 # Row unit in the Sheet -> (unit the user types a price in, factor).
 # price_per_row_unit = price_per_entry_unit * factor  (e.g. €/kg * 0.001 = €/gram).
@@ -271,7 +276,8 @@ def delivery_check(settings, today):
     """Validate the stored delivery check. Returns dict with ok, problems and the parsed fields."""
     get = lambda k: (settings.get(DELIVERY_KEYS[k]) or {}).get("value")
     amount, verified = number(get("amount")), parse_date(get("verified"))
-    when, supplier, slot, source = parse_date(get("date")), text(get("supplier")), text(get("slot")), text(get("source"))
+    when, supplier, source = parse_date(get("date")), text(get("supplier")), text(get("source"))
+    basket = number(get("basket"))
     problems = []
     if not supplier:
         problems.append("leverancier ontbreekt")
@@ -279,8 +285,6 @@ def delivery_check(settings, today):
         problems.append("bezorgdatum ontbreekt")
     elif when < today:
         problems.append(f"bezorgdatum {when:%d-%m-%Y} is voorbij")
-    if not slot:
-        problems.append("bezorgmoment ontbreekt")
     if not source:
         problems.append("bron van de controle ontbreekt")
     if verified is None:
@@ -293,8 +297,10 @@ def delivery_check(settings, today):
         problems.append("bezorgkosten ontbreken")
     elif round(amount, 2) != 0:
         problems.append(f"bezorgkosten €{amount:.2f}; GO vereist exact €0,00")
+    basket_problem = None if basket is not None and basket >= 0 else "mandtotaal uit de checkout ontbreekt"
     return {"ok": not problems, "problems": problems, "amount": None if amount is None else round(amount, 2),
-            "verified": verified, "date": when, "supplier": supplier, "slot": slot, "source": source}
+            "verified": verified, "date": when, "supplier": supplier, "source": source,
+            "basket": None if basket_problem else round(basket, 2), "basket_problem": basket_problem}
 
 
 def price_status(item, delivery):
@@ -364,10 +370,13 @@ def is_active(item):
     return text(item.get("Status")).casefold() != ARCHIVED.casefold()
 
 
-def latest_price(prices, product, supplier):
-    """Most recently checked Prijzen row for product + supplier, mapped to the keys price_status uses."""
+def latest_price(prices, product, supplier, kinds=(PRICE_NORMAL, PRICE_OFFER)):
+    """Most recently checked Prijzen row of one of `kinds` for product + supplier, mapped to the keys price_status
+    uses. Default: confirmed kinds only, so an imported open-data row never shadows a confirmed price or offer."""
     best = None
     for p in prices or []:
+        if text(p.get("Prijssoort")) not in kinds:
+            continue
         if same_name(p.get("Product"), product) and same_name(p.get("Leverancier"), supplier):
             if best is None or (parse_date(p.get("Prijsdatum")) or date.min) > (parse_date(best.get("Prijsdatum")) or date.min):
                 best = p
@@ -376,24 +385,75 @@ def latest_price(prices, product, supplier):
     return {"Prijs/eenheid €": best.get("Prijs/eenheid €"), "Prijs leverancier": best.get("Leverancier"),
             "Prijssoort": best.get("Prijssoort"), "Geldig t/m": best.get("Geldig t/m"),
             "Prijsdatum": best.get("Prijsdatum"), "Verpakking": best.get("Verpakking"),
-            "Bron": best.get("Bron"), "_price_row": best.get("_row")}
+            "Bron": best.get("Bron"), "Prijs verpakking €": best.get("Prijs verpakking €"),
+            "Min. aantal": best.get("Min. aantal"), "_price_row": best.get("_row")}
 
 
-def priced_line(item, prices, supplier):
+_PRICE_FIELDS = ("Prijs/eenheid €", "Prijs leverancier", "Prijssoort", "Geldig t/m", "Prijsdatum", "Verpakking",
+                 "Bron", "Prijs verpakking €", "Min. aantal")
+
+
+def priced_line(item, prices, supplier, kinds=(PRICE_NORMAL, PRICE_OFFER)):
     """Aanvullijst line with the price fields of `supplier` from the Prijzen tab (price fields cleared if none)."""
-    merged = {k: v for k, v in item.items() if k not in ("Prijs/eenheid €", "Prijs leverancier", "Prijssoort",
-                                                       "Geldig t/m", "Prijsdatum", "Verpakking")}
-    merged.update(latest_price(prices, item.get("Product"), supplier))
+    merged = {k: v for k, v in item.items() if k not in _PRICE_FIELDS}
+    merged.update(latest_price(prices, item.get("Product"), supplier, kinds))
     return merged
 
 
-def shopping_totals(rows, inventory, delivery, today, prices=None):
-    """Only return a spend estimate after every needed quantity, stock count and price is verified.
+def packs_needed(item):
+    wanted, size = number(item.get("Te bestellen")), pack_size(item.get("Verpakking"), item.get("Eenheid"))
+    if wanted is None or size is None:
+        return None
+    return math.ceil(round(wanted / size, 9))
 
-    F = quantity to buy (row unit), G = price per *row unit*, K = price check date.
-    H is a Sheet formula; we recalculate (in whole packs) rather than trust it.
-    A number in F is not enough: F may be computed from unknown or old stock.
-    prices: Prijzen rows; when given, each line is priced from the delivery supplier's row there.
+
+def open_status(item, reference, today):
+    """'actueel' only for an open-data price with an exact measurement date ('Geldig t/m' == 'Prijsdatum') within
+    CHECK_WINDOW_DAYS before `reference` (the delivery date) and a known pack content; else why not."""
+    if not item or not text(item.get("Prijssoort")):
+        return "niet gekoppeld"
+    measured, exact = parse_date(item.get("Prijsdatum")), parse_date(item.get("Geldig t/m"))
+    if measured is None or exact != measured or measured > today or measured < reference - timedelta(days=CHECK_WINDOW_DAYS):
+        return "verouderd"
+    if pack_size(item.get("Verpakking"), item.get("Eenheid")) is None or not number(item.get("Prijs/eenheid €")):
+        return "inhoud onbekend"
+    return "actueel"
+
+
+def line_price(item, prices, supplier, delivery, today):
+    """(priced item, basis, note) for one line at `supplier`. basis: 'bevestigd', 'aanbieding' or 'open data';
+    (None, None, why) when no usable price. prices=None: use the price fields already on the line."""
+    d = dict(delivery or {}, supplier=supplier, today=today)
+    confirmed = item if prices is None else priced_line(item, prices, supplier)
+    status = price_status(confirmed, d)
+    note = status
+    if status == "ok":
+        minimum, packs = number(confirmed.get("Min. aantal")), packs_needed(confirmed)
+        offer = text(confirmed.get("Prijssoort")) == PRICE_OFFER
+        if not (offer and minimum and (packs is None or packs < minimum)):
+            return confirmed, "aanbieding" if offer else "bevestigd", ""
+        note = f"aanbieding pas vanaf {minimum:g} verpakkingen"
+    if prices is None:
+        return None, None, note
+    reference = d.get("date") or today
+    open_item = priced_line(item, prices, supplier, kinds=(OPEN_DATA,))
+    state = open_status(open_item, reference, today)
+    if state == "actueel":
+        return open_item, "open data", ""
+    if status == "ontbreekt":
+        note = "geen prijs" if state == "niet gekoppeld" else f"open data {state}"
+    elif state != "niet gekoppeld":
+        note += f"; open data {state}"
+    return None, None, note
+
+
+def shopping_totals(rows, inventory, delivery, today, prices=None):
+    """Stock readiness, the EXPECTED amount (indicative line prices) and the checkout-based GO total.
+
+    F = quantity to buy (row unit), G = price per *row unit*. H is a Sheet formula; we recalculate (in whole
+    packs) rather than trust it. A number in F is not enough: F may be computed from unknown or old stock.
+    prices: Prijzen rows; when given, each line is priced via line_price for the delivery supplier.
+    The GO total is the checkout basket total + the confirmed delivery costs, never a sum of line prices.
     Archived Voorraad products are not ordered and are listed in 'archived'.
     """
     delivery = dict(delivery or {}, today=today)
@@ -407,7 +467,7 @@ def shopping_totals(rows, inventory, delivery, today, prices=None):
     archived, lines = [], []
     missing_stock, missing_inventory, missing_price, invalid_price = [], [], [], []
     stock_reasons = {}
-    total = 0.0
+    total, open_lines = 0.0, 0
     ready_count = 0
     for item in rows:
         name = text(item.get("Product"))
@@ -416,8 +476,6 @@ def shopping_totals(rows, inventory, delivery, today, prices=None):
         if name.casefold() in archived_names and name.casefold() not in stock:
             archived.append(name)
             continue
-        if prices is not None:
-            item = priced_line(item, prices, delivery.get("supplier"))
         problem = stock_problem(item, stock.get(name.casefold(), []), reference, today)
         line = {"product": name, "aantal": number(item.get("Te bestellen")), "eenheid": text(item.get("Eenheid")),
                 "bedrag": None, "opmerking": problem or ""}
@@ -433,30 +491,38 @@ def shopping_totals(rows, inventory, delivery, today, prices=None):
         if number(item.get("Te bestellen")) == 0:
             continue
         ready_count += 1
-        status = price_status(item, delivery)
-        line["opmerking"] = "prijs geldig" if status == "ok" else f"prijs: {status}"
+        priced, basis, note = line_price(item, prices, delivery.get("supplier"), delivery, today)
         lines.append(line)
-        if status == "ok":
-            line["bedrag"] = line_cost(item)
-            total += line_cost(item)
-        elif status == "ontbreekt":
+        if priced is not None:
+            line["bedrag"] = line_cost(priced)
+            line["opmerking"] = f"verwacht ({basis})"
+            total += line["bedrag"]
+            open_lines += basis == "open data"
+        elif note in ("geen prijs", "ontbreekt"):
             missing_price.append(name)
+            line["opmerking"] = "geen prijs"
         else:
-            invalid_price.append((name, status))
-    lines_ok = bool(rows) and not (missing_stock or missing_inventory or missing_price or invalid_price)
+            invalid_price.append((name, note))
+            line["opmerking"] = note
+    stock_ok = bool(rows) and not (missing_stock or missing_inventory)
     delivery_ok = bool(delivery.get("ok"))
-    ready = lines_ok and ready_count > 0 and delivery_ok
+    basket = delivery.get("basket") if delivery_ok else None
+    ready = stock_ok and ready_count > 0 and delivery_ok and basket is not None
+    priced_all = stock_ok and not (missing_price or invalid_price)
     return {
         "ready": ready,
-        "shopping_total": round(total, 2) if lines_ok else None,
+        "expected_total": cents(total) if priced_all else None,
+        "expected_open_lines": open_lines,
+        "basket_total": basket,
         "delivery_total": delivery.get("amount") if delivery_ok else None,
-        "grand_total": round(total + delivery["amount"], 2) if ready else None,
+        "grand_total": cents(basket + delivery["amount"]) if ready else None,
         "missing_stock": missing_stock,
         "stock_reasons": stock_reasons,
         "missing_inventory": missing_inventory,
         "missing_price": missing_price,
         "invalid_price": invalid_price,
         "delivery_problems": list(delivery.get("problems") or []),
+        "basket_problem": delivery.get("basket_problem") if delivery_ok else None,
         "needed_lines": ready_count,
         "archived": archived,
         "lines": lines,
@@ -484,18 +550,16 @@ def go_decision(spend, budget, schema=None):
     if spend["missing_stock"]:
         reasons.append(f"{len(spend['missing_stock'])} voorraadtelling(en) niet bruikbaar: " + "; ".join(
             f"{n} ({spend['stock_reasons'].get(n, 'onbekend')})" for n in spend["missing_stock"]))
-    if spend["missing_price"]:
-        reasons.append(f"{len(spend['missing_price'])} prijs/prijzen ontbreken")
-    if spend["invalid_price"]:
-        reasons.append(f"{len(spend['invalid_price'])} prijs/prijzen niet geldig op de bezorgdatum: "
-                       + "; ".join(f"{n} ({why})" for n, why in spend["invalid_price"]))
+    if spend.get("basket_problem"):
+        reasons.append("Mandtotaal uit de checkout ontbreekt (Bestellen → Bezorging en checkout)")
     if not reasons and spend["needed_lines"] == 0:
         reasons.append("Geen te bestellen regels gevonden (lege of ontbrekende Aanvullijst)")
     if not reasons and spend["grand_total"] is not None and spend["grand_total"] > budget:
         reasons.append(f"Budget overschreden: €{spend['grand_total']:.2f} op €{budget:.2f}")
     if reasons or not spend["ready"]:
         return False, reasons or ["Controles nog open"]
-    return True, [f"Binnen budget: €{spend['grand_total']:.2f} van €{budget:.2f} inclusief €0,00 bezorging"]
+    return True, [f"Binnen budget: €{spend['grand_total']:.2f} van €{budget:.2f} (checkout €{spend['basket_total']:.2f}"
+                  f" + €{spend['delivery_total']:.2f} bezorging)"]
 
 
 def delta_changes(old, new, key):
@@ -603,18 +667,18 @@ def compare_suppliers(rows, inventory, prices, suppliers, delivery, today):
         name = text(sup.get("LEVERANCIERS"))
         if not name:
             continue
-        missing, groceries = [], 0.0
+        missing, groceries, open_lines = [], 0.0, 0
         for item in needed:
-            line = priced_line(item, prices, name)
-            status = price_status(line, dict(delivery, supplier=name, date=target))
-            if status == "ok":
+            line, basis, note = line_price(item, prices, name, dict(delivery, date=target), today)
+            if line is not None:
                 groceries += line_cost(line)
+                open_lines += basis == "open data"
             else:
-                missing.append((text(item.get("Product")), status))
+                missing.append((text(item.get("Product")), note))
         ship, ship_why = supplier_delivery(sup, delivery, target, today)
         extra = number(sup.get("Reis- en tijdkosten €"))
         pickup = "zelf" in text(sup.get("Koopwijze")).lower()
-        problems = [f"{len(missing)} prijs/prijzen ontbreken of zijn niet geldig"] if missing else []
+        problems = [f"{len(missing)} prijs/prijzen ontbreken of zijn verouderd"] if missing else []
         if stock_blocked:
             problems.append("voorraad nog niet betrouwbaar")
         if not needed:
@@ -627,7 +691,7 @@ def compare_suppliers(rows, inventory, prices, suppliers, delivery, today):
         total = cents(groceries + (ship or 0) + (extra or 0)) if complete else None
         results.append({"supplier": name, "pickup": pickup, "groceries": cents(groceries) if not missing else None,
                         "delivery": ship, "extra": extra or 0.0, "total": total, "complete": complete,
-                        "problems": problems, "missing": missing})
+                        "problems": problems, "missing": missing, "open_lines": open_lines})
     return results
 
 
@@ -731,8 +795,11 @@ def weeklijst_rows(menu, spend, comparison, saving, go, reasons, delivery, budge
     rows.append(["Bezorgkosten", delivery.get("supplier") or "", "", "",
                  "" if delivery.get("amount") is None else delivery["amount"],
                  "geldig" if delivery.get("ok") else "; ".join(delivery.get("problems") or [])])
+    expected = spend.get("expected_total")
+    rows.append(["Verwacht", "boodschappen (indicatief)", "", "", "" if expected is None else expected,
+                 "som van regelprijzen; geen bevestigd bedrag"])
     total = spend.get("grand_total")
-    rows.append(["Totaal", "incl. bezorging", "", "", "" if total is None else total,
+    rows.append(["Totaal", "checkout incl. bezorging", "", "", "" if total is None else total,
                  "" if total is None or budget is None else f"budgetverschil €{cents(budget - total):.2f}"])
     return rows
 

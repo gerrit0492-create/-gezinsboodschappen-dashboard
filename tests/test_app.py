@@ -168,12 +168,13 @@ def count_kaas(at, value=0.0):
     assert not at.exception, at.exception
 
 
-def save_delivery(at, amount=0.0, day=TOMORROW):
+def save_delivery(at, amount=0.0, day=TOMORROW, basket=6.25):
     next(d for d in at.date_input if d.label.startswith("Bezorgdatum")).set_value(day)
-    next(t for t in at.text_input if t.label == "Bezorgmoment").input("18:00-20:00")
+    assert not any(t.label == "Bezorgmoment" for t in at.text_input)      # field removed
+    num(at, "Mandtotaal boodschappen").set_value(basket)
     num(at, "Bezorgkosten € (checkout)").set_value(amount)
     next(t for t in at.text_input if t.label == "Bron van de controle").input("checkout-scherm")
-    next(c for c in at.checkbox if c.label.startswith("Ik heb dit bedrag")).check()
+    next(c for c in at.checkbox if c.label.startswith("Ik heb deze bedragen")).check()
     btn(at, "Bezorgcontrole opslaan").click().run()
     assert not at.exception, at.exception
 
@@ -233,12 +234,16 @@ def test_full_flow_reaches_go_and_writes_only_target_cells(monkeypatch):
     save_delivery(at, 0.0)
     save_price(at, 6.25, 500.0)
     assert go_shown(at), [w.value for w in at.warning]
-    assert any(m.value == "€6.25" for m in at.metric if m.label.startswith("Totaal"))
+    assert any(m.value == "€6.25" for m in at.metric if m.label.startswith("Totaal checkout"))
+    assert any(m.value == "€6.25" for m in at.metric if m.label.startswith("Verwacht"))
     p = book.tabs["Prijzen"].grid[1]
     assert p[:6] == ["Kaas", "Jumbo", 6.25, "500 gram", 0.0125, "Normaal"] and p[6] == TOMORROW.isoformat()
     assert set(book.tabs["Voorraad"].writes) == {"D3", "G3", "H3", "I3"}
     assert book.tabs["Aanvullijst"].writes == []                         # formulas E/F/H untouched
-    assert all(r.startswith("B") for r in book.tabs["Instellingen"].writes)
+    inst = book.tabs["Instellingen"]
+    assert inst.grid[9][:2] == ["Mandtotaal checkout", 6.25]              # missing key row added once, below the data
+    assert all(r.startswith("B") for r in inst.writes if r not in ("A10", "C10"))
+    assert inst.grid[8][0] == "Bezorgkosten bron" and inst.grid[7] == ["Bezorgmoment", "", ""]   # old row untouched
 
 
 def test_paid_delivery_stays_no_go(monkeypatch):
@@ -256,7 +261,24 @@ def test_expired_offer_is_refused(monkeypatch):
     save_delivery(at, 0.0, day=TODAY + timedelta(days=2))
     save_price(at, kind="Aanbieding", offer_end=TOMORROW)
     assert any("minstens tot de bezorgdatum" in e.value for e in at.error)
-    assert len(book.tabs["Prijzen"].grid) == 1 and not go_shown(at)
+    assert len(book.tabs["Prijzen"].grid) == 1        # refused offer is not stored (GO rests on the checkout total)
+
+
+def test_checkout_total_over_budget_is_no_go(monkeypatch):
+    at, _ = start(monkeypatch, make_book())
+    count_kaas(at)
+    save_delivery(at, 0.0, basket=150.01)
+    assert not go_shown(at) and any("Budget overschreden: €150.01" in w.value for w in at.warning)
+
+
+def test_without_checkout_total_no_go_even_with_confirmed_prices(monkeypatch):
+    book = make_book()
+    at, _ = start(monkeypatch, book)
+    count_kaas(at)
+    save_delivery(at, 0.0, basket=None)
+    assert any("mandtotaal uit de checkout" in e.value for e in at.error), [e.value for e in at.error]
+    assert not go_shown(at)
+    assert book.tabs["Instellingen"].writes == []
 
 
 def test_unknown_stock_blocks_go(monkeypatch):
@@ -356,7 +378,7 @@ def test_stores_tab_makes_no_cheapest_claim(monkeypatch):
     at, _ = start(monkeypatch, make_book())
     texts = " ".join(m.value for m in at.markdown) + " ".join(c.value for c in at.caption)
     assert "goedkoopst" not in texts.lower() and "winnaar" not in texts.lower()   # Sheet note is not shown as a claim
-    assert "onvolledig" in texts and "geen live koppeling" in texts
+    assert "onvolledig" in texts and "nooit mee" in texts
 
 
 def test_scan_tab_claims_no_ai(monkeypatch):
@@ -462,3 +484,90 @@ def test_product_form_reports_partial_save(monkeypatch):
     next(b for b in at.button if b.label == "💾 Opslaan" and "product" in str(b.form_id)).click().run()
     assert any(e.value.startswith("Deels opgeslagen") and "telling 20" in e.value for e in at.error)
     assert book.tabs["Voorraad"].grid[1][3] == 20.0 and book.tabs["Voorraad"].grid[1][2] == "Voorraadkast"
+
+
+# --- open data: 'Prijzen bijwerken' and one-time linking (network mocked) ------------------------------
+
+JUMBO_URL = "https://www.jumbo.com/producten/"
+OPEN_DATASET = [{"n": "jumbo", "u": JUMBO_URL, "d": [
+    {"n": "Jumbo Kaas Plakken Jong", "l": "kaas-3", "p": 2.99, "s": "300 g"},
+    {"n": "Old Amsterdam Kaas Plakken", "l": "kaas-2", "p": 4.29, "s": "200 g"}]},
+    {"n": "ah", "u": "https://www.ah.nl/producten/product/", "d": []},
+    {"n": "lidl", "u": "https://boodschaapje.nl/product/", "d": []}]
+
+
+def mock_open_data(monkeypatch, jumbo_age_days):
+    """Commit history where Jumbo's data last changed `jumbo_age_days` ago; AH/Lidl never in the listed range."""
+    import open_prices
+    commits = [(f"c{i}", TODAY - timedelta(days=i)) for i in range(30)]
+    fetched = []
+
+    def dataset(sha):
+        fetched.append(sha)
+        i = int(sha[1:])
+        if i <= jumbo_age_days:
+            return OPEN_DATASET
+        return [dict(m, d=[dict(a, p=a["p"] + 1) for a in m["d"]]) if m["n"] == "jumbo" else m for m in OPEN_DATASET]
+    monkeypatch.setattr(open_prices, "fetch_commits", lambda: commits)
+    monkeypatch.setattr(open_prices, "fetch_dataset", dataset)
+    return fetched
+
+
+def test_update_prices_refreshes_linked_article_and_keeps_confirmed_rows(monkeypatch):
+    book = make_book()
+    p = book.tabs["Prijzen"].grid
+    confirmed = ["Kaas", "Jumbo", 6.25, "500 gram", 0.0125, "Normaal", TOMORROW.isoformat(), TODAY.isoformat(), "web"]
+    p.append(list(confirmed))
+    p.append(["Kaas", "Jumbo", 1.99, "300 gram", 0.0066, "Open data", "2026-01-01", "2026-01-01", JUMBO_URL + "kaas-3"])
+    mock_open_data(monkeypatch, jumbo_age_days=23)
+    at, _ = start(monkeypatch, book)
+    btn(at, "Prijzen bijwerken").click().run()
+    assert not at.exception, at.exception
+    msg = " ".join(s.value for s in at.success)
+    assert "1 gewijzigd" in msg and "Jumbo: gemeten" in msg and "(23 dagen geleden) → verouderd" in msg
+    assert "AH: gemeten op of vóór" in msg                         # unknown real date is never presented as exact
+    measured = (TODAY - timedelta(days=23)).isoformat()
+    assert p[1] == confirmed                                         # confirmed price untouched
+    assert p[2][:9] == ["Kaas", "Jumbo", 2.99, "300 gram", p[2][4], "Open data", measured, measured,
+                        JUMBO_URL + "kaas-3"]
+    assert abs(p[2][4] - 2.99 / 300) < 1e-9                         # stored on 10 decimals
+    assert set(book.tabs["Prijzen"].writes) == {f"{c}3" for c in "CDEFGHI"}
+    assert book.tabs["Voorraad"].writes == [] and book.tabs["Aanvullijst"].writes == []
+    texts = " ".join(m.value for m in at.markdown)
+    assert "**verouderd**" in texts                                  # 23 days old: never counted as current
+
+
+def test_open_data_failure_changes_nothing(monkeypatch):
+    import open_prices
+    book = make_book()
+
+    def boom():
+        raise OSError("403 rate limit")
+    monkeypatch.setattr(open_prices, "fetch_commits", boom)
+    at, _ = start(monkeypatch, book)
+    btn(at, "Prijzen bijwerken").click().run()
+    assert any("Open data niet bereikbaar" in e.value for e in at.error)
+    assert book.tabs["Prijzen"].writes == []
+
+
+def test_link_article_once_then_current_open_price_feeds_expected_amount(monkeypatch):
+    book = make_book()
+    fetched = mock_open_data(monkeypatch, jumbo_age_days=1)
+    at, _ = start(monkeypatch, book)
+    count_kaas(at)
+    btn(at, "Open data laden").click().run()
+    next(s for s in at.selectbox if s.label == "Supermarkt" and s.key == "link_supplier").set_value("Jumbo").run()
+    radio = next(r for r in at.radio if r.label.startswith("Kies het artikel"))
+    assert radio.options[0].startswith("🏷️ huismerk · Jumbo Kaas Plakken Jong")
+    btn(at, "Koppelen").click().run()
+    assert not at.exception, at.exception
+    row = book.tabs["Prijzen"].grid[1]
+    measured = (TODAY - timedelta(days=1)).isoformat()
+    assert row[:4] == ["Kaas", "Jumbo", 2.99, "300 gram"] and row[5:] == ["Open data", measured, measured,
+                                                                          JUMBO_URL + "kaas-3"]
+    save_delivery(at, 0.0, basket=7.10)
+    expected = next(m for m in at.metric if m.label.startswith("Verwacht"))
+    assert expected.value == "€5.98"                                 # 2 packs of 300 g from current open data
+    assert any(m.value == "€7.10" for m in at.metric if m.label.startswith("Totaal checkout"))   # GO = checkout
+    assert go_shown(at)
+    assert len(set(fetched)) == len(fetched) < 12                    # each version downloaded once, then cached

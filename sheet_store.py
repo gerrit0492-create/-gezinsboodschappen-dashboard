@@ -19,7 +19,7 @@ from __future__ import annotations
 import re
 from decimal import Decimal
 
-from core import (APP_COUNT, ARCHIVED, DELIVERY_KEYS, PRICE_NORMAL, PRICE_OFFER, column_letter, is_checked, number,
+from core import (ADDABLE_SETTINGS, APP_COUNT, ARCHIVED, DELIVERY_KEYS, OPEN_DATA, PRICE_NORMAL, PRICE_OFFER, column_letter, is_checked, number,
                   pack_size, pack_to_row_unit_price, parse_date, receipt_key, text)
 
 TAB_NAMES = ["Overzicht", "Voorraad", "Aanvullijst", "Weekmenu", "Instellingen", "Leveranciers", "Bonnen", "Prijzen",
@@ -193,14 +193,18 @@ def write_basket(book, changes):
 def write_delivery(book, record, old):
     """Store a delivery check in Instellingen column B.
 
-    record/old: {field: value} for the fields in core.DELIVERY_KEYS. All key rows must already
-    exist in column A (the app never guesses where to add rows); every current value must still
-    equal the snapshot (`old`), otherwise nothing is written.
+    record/old: {field: value} for the fields in core.DELIVERY_KEYS. The key rows must already exist in column A,
+    except core.ADDABLE_SETTINGS: such a missing key is added (A/B, plus C 'Toelichting' when that header exists)
+    in the first completely empty row directly below the last used row. Every current value must still equal
+    the snapshot (`old`), otherwise nothing is written.
     """
     amount = number(record.get("amount"))
     if amount is None or amount < 0:
         raise ValueError("Bezorgkosten mogen niet negatief zijn")
-    for field in ("supplier", "slot", "source"):
+    basket = number(record.get("basket"))
+    if basket is None or basket < 0:
+        raise ValueError("Mandtotaal uit de checkout is verplicht en mag niet negatief zijn")
+    for field in ("supplier", "source"):
         if not text(record.get(field)):
             raise ValueError(f"Veld '{DELIVERY_KEYS[field]}' is verplicht")
     when, verified = parse_date(record.get("date")), parse_date(record.get("verified"))
@@ -212,21 +216,32 @@ def write_delivery(book, record, old):
     if head != ["Instelling", "Waarde"]:
         raise ConflictError("Tab Instellingen heeft niet de kolommen 'Instelling' en 'Waarde' in A/B")
     keys = {text(r[0]): i + 1 for i, r in enumerate(grid) if r and text(r[0])}
-    missing = [k for k in DELIVERY_KEYS.values() if k not in keys]
+    missing = [k for k in DELIVERY_KEYS.values() if k not in keys and k not in ADDABLE_SETTINGS]
     if missing:
         raise ConflictError("Voeg eerst deze regel(s) toe in kolom A van Instellingen: " + ", ".join(missing))
-    req = []
+    req, new_row = [], len(grid) + 1        # get_all_values drops trailing empty rows: len+1 is empty
+    explain = "Toelichting" in [text(h) for h in (grid[0] if grid else [])][2:3]
     for field, key in DELIVERY_KEYS.items():
+        if key not in keys:
+            if text(old.get(field)):
+                raise ConflictError(f"'{key}' is intussen uit de Sheet verdwenen. Vernieuw de data.")
+            keys[key] = new_row
+            req.append({"range": f"A{new_row}", "values": [[key]]})
+            if explain:
+                req.append({"range": f"C{new_row}", "values": [["Boodschappentotaal uit de checkout, zonder "
+                                                                 "bezorgkosten (ingevuld via de app)"]]})
+            new_row += 1
+            grid = grid + [[key]]
         current = grid[keys[key] - 1]
         now = current[1] if len(current) > 1 else None
         before = old.get(field)
-        same = (number(now) == number(before)) if field == "amount" else (
+        same = (number(now) == number(before)) if field in ("amount", "basket") else (
             parse_date(now) == parse_date(before) if field in ("date", "verified") else text(now) == text(before))
         if not same:
             raise ConflictError(f"'{key}' is intussen gewijzigd in de Sheet. Vernieuw de data.")
         value = record[field]
-        if field == "amount":
-            value = round(amount, 2)
+        if field in ("amount", "basket"):
+            value = round(number(record[field]), 2)
         elif field in ("date", "verified"):
             value = parse_date(value).isoformat()
         else:
@@ -395,10 +410,13 @@ def archive_product(book, row, product, snapshot, restore=False):
     write_details(book, row, product, {"Status": "Actief" if restore else ARCHIVED}, snapshot)
 
 
-def write_price(book, product, supplier, pack_price, pack, unit, kind, valid_through, verified, source, snapshot=None):
-    """Store a checked price in Prijzen: updates the (product, supplier) row or adds one.
+def write_price(book, product, supplier, pack_price, pack, unit, kind, valid_through, verified, source, snapshot=None,
+                minimum=False):
+    """Store a checked price in Prijzen: updates the (product, supplier) confirmed row or adds one.
 
     snapshot: the Prijzen row as loaded (or None when the app saw no row); it must still match.
+    minimum: offer minimum number of packs for the optional 'Min. aantal' column (None = clear it); False = the
+    column is not used (the app never adds it).
     """
     per_unit = pack_to_row_unit_price(pack_price, pack)
     if not text(supplier) or not text(product):
@@ -416,11 +434,14 @@ def write_price(book, product, supplier, pack_price, pack, unit, kind, valid_thr
     values = {"Product": text(product), "Leverancier": text(supplier), "Prijs verpakking €": round(number(pack_price), 2),
               "Verpakking": packing, "Prijs/eenheid €": per_unit, "Prijssoort": kind, "Geldig t/m": until.isoformat(),
               "Prijsdatum": verified.isoformat(), "Bron": text(source)}
+    if minimum is not False:
+        if minimum is not None and (number(minimum) is None or number(minimum) < 1):
+            raise ValueError("Minimum aantal moet minstens 1 zijn")
+        values["Min. aantal"] = "" if minimum is None else int(number(minimum))
     ws = book.worksheet("Prijzen")
     grid, col, headers = _fresh(ws, list(values))
-    rows = [i + 1 for i, r in enumerate(grid) if i and r
-            and text(r[headers.index("Product")]).casefold() == text(product).casefold()
-            and text(r[headers.index("Leverancier")]).casefold() == text(supplier).casefold()]
+    rows = [i + 1 for i in _price_rows(grid, headers, product, supplier)
+            if text(_cell(grid, headers, i + 1, "Prijssoort")) != OPEN_DATA]    # open-data rows are separate
     if len(rows) > 1:
         raise ConflictError(f"'{product}' bij {supplier} staat meerdere keren in Prijzen; ruim dat eerst op.")
     if rows:
@@ -434,6 +455,67 @@ def write_price(book, product, supplier, pack_price, pack, unit, kind, valid_thr
     if snapshot is not None:
         raise ConflictError(f"Prijsregel van '{product}' bij {supplier} is verdwenen. Vernieuw de data.")
     return _append_row(ws, values, list(values))
+
+
+def _price_rows(grid, headers, product, supplier):
+    """0-based grid indices of the Prijzen data rows for product + supplier."""
+    p, l = headers.index("Product"), headers.index("Leverancier")
+    return [i for i, r in enumerate(grid) if i and r
+            and text(r[p] if p < len(r) else "").casefold() == text(product).casefold()
+            and text(r[l] if l < len(r) else "").casefold() == text(supplier).casefold()]
+
+
+OPEN_HEADERS = ["Product", "Leverancier", "Prijs verpakking €", "Verpakking", "Prijs/eenheid €", "Prijssoort",
+                "Geldig t/m", "Prijsdatum", "Bron"]
+
+
+def write_open_prices(book, changes):
+    """Store open-data prices: one 'Open data' row per product + supplier (separate from confirmed rows, which are
+    never touched). changes: [{"product", "supplier", "values": {header: value}, "seen": row dict or None}].
+
+    Existing rows are updated in ONE request after checking they still hold the same product, supplier, kind,
+    article (Bron) and date the user saw; new rows are appended in ONE request. Returns (updated, added).
+    """
+    if not changes:
+        return 0, 0
+    ws = book.worksheet("Prijzen")
+    prepared = _prepare_append(ws, OPEN_HEADERS)
+    grid, _, col, headers = prepared
+    updates, appends, updated = [], [], 0
+    for c in changes:
+        values = dict(c["values"], Product=text(c["product"]), Leverancier=text(c["supplier"]), Prijssoort=OPEN_DATA)
+        if not text(values.get("Bron")) or parse_date(values.get("Prijsdatum")) is None:
+            raise ValueError(f"Bron en meetdatum zijn verplicht ({c['product']} bij {c['supplier']})")
+        rows = [i + 1 for i in _price_rows(grid, headers, c["product"], c["supplier"])
+                if text(_cell(grid, headers, i + 1, "Prijssoort")) == OPEN_DATA]
+        if len(rows) > 1:
+            raise ConflictError(f"'{c['product']}' bij {c['supplier']} heeft meerdere open-data-regels in Prijzen; "
+                                "ruim dat eerst op.")
+        seen = c.get("seen")
+        if rows:
+            row = rows[0]
+            if seen is None or int(seen.get("_row") or 0) != row or any(
+                    text(_cell(grid, headers, row, h)) != text(seen.get(h)) for h in ("Bron", "Prijsdatum")):
+                raise ConflictError(f"Open-data-prijs van '{c['product']}' bij {c['supplier']} is intussen gewijzigd. "
+                                    "Vernieuw de data.")
+            updates += [{"range": f"{col[h]}{row}", "values": [[_user_entered(v)]]} for h, v in values.items()
+                        if h not in ("Product", "Leverancier")]
+            updated += 1
+        elif seen is not None:
+            raise ConflictError(f"Open-data-regel van '{c['product']}' bij {c['supplier']} is verdwenen. Vernieuw de data.")
+        else:
+            appends.append(values)
+    if updates:
+        _safe_update(ws, updates, value_input_option="USER_ENTERED")
+    if appends:
+        try:
+            _append_rows(ws, appends, OPEN_HEADERS, None if updates else prepared)
+        except Exception as exc:
+            if updates:
+                raise PartialSaveError(f"{updated} bestaande prijsregel(s) zijn bijgewerkt, maar de nieuwe regel(s) "
+                                       f"niet: {exc}") from exc
+            raise
+    return updated, len(appends)
 
 
 def write_receipts(book, entries, today):

@@ -33,9 +33,9 @@ INSTELLINGEN = [
 ]
 PRIJZEN = [["Product", "Leverancier", "Prijs verpakking €", "Verpakking", "Prijs/eenheid €", "Prijssoort",
             "Geldig t/m", "Prijsdatum", "Bron"]]
-EMPTY_OLD = {"amount": "", "verified": "", "supplier": "", "date": "", "slot": "", "source": ""}
+EMPTY_OLD = {"amount": "", "verified": "", "supplier": "", "date": "", "source": "", "basket": ""}
 RECORD = {"amount": 0.0, "verified": TODAY, "supplier": "Jumbo", "date": date(2026, 11, 6),
-          "slot": "18:00-20:00", "source": "checkout-scherm"}
+          "source": "checkout-scherm", "basket": 123.456}
 
 
 class FakeSheet:
@@ -132,19 +132,43 @@ def test_basket_write_and_conflict():
 def test_delivery_write_fills_only_value_cells():
     ws = FakeSheet(INSTELLINGEN)
     write_delivery(FakeBook(Instellingen=ws), RECORD, EMPTY_OLD)
-    assert ranges(ws) == {"B3": [0.0], "B4": ["2026-11-05"], "B5": ["Jumbo"], "B6": ["2026-11-06"],
-                          "B7": ["18:00-20:00"], "B8": ["checkout-scherm"]}
-    assert all(r.startswith("B") for r in ranges(ws))  # never touches keys (A) or notes (C)
+    got = ranges(ws)
+    # the old 'Bezorgmoment' row (B7) is no longer read or written; the missing 'Mandtotaal checkout' key is added
+    # once in the first empty row below the data (A9 + note C9), its value on 2 decimals
+    assert got == {"B3": [0.0], "B4": ["2026-11-05"], "B5": ["Jumbo"], "B6": ["2026-11-06"],
+                   "B8": ["checkout-scherm"], "A9": ["Mandtotaal checkout"], "B9": [123.46],
+                   "C9": [got["C9"][0]]}
+    assert "zonder bezorgkosten" in got["C9"][0]
 
 
-def test_delivery_never_appends_rows():
-    ws = FakeSheet(INSTELLINGEN[:3])  # date/supplier/slot rows not created yet
+def test_delivery_updates_existing_basket_row_in_place():
+    grid = [list(r) for r in INSTELLINGEN] + [["Mandtotaal checkout", 99.0, ""]]
+    ws = FakeSheet(grid)
+    write_delivery(FakeBook(Instellingen=ws), RECORD, dict(EMPTY_OLD, basket=99.0))
+    got = ranges(ws)
+    assert got["B9"] == [123.46] and not any(r.startswith(("A", "C")) for r in got)
+
+
+def test_delivery_refuses_when_basket_row_appeared_or_vanished():
+    grid = [list(r) for r in INSTELLINGEN] + [["Mandtotaal checkout", 80.0, ""]]
+    ws = FakeSheet(grid)                      # another session added the row with a value meanwhile
+    with pytest.raises(ConflictError, match="Mandtotaal checkout"):
+        write_delivery(FakeBook(Instellingen=ws), RECORD, EMPTY_OLD)
+    ws2 = FakeSheet(INSTELLINGEN)             # the row the user saw (with a value) was removed
+    with pytest.raises(ConflictError, match="verdwenen"):
+        write_delivery(FakeBook(Instellingen=ws2), RECORD, dict(EMPTY_OLD, basket=50.0))
+    assert ws.updates == [] and ws2.updates == []
+
+
+def test_delivery_never_adds_required_rows():
+    ws = FakeSheet(INSTELLINGEN[:3])  # date/supplier rows not created yet: only Mandtotaal may be added
     with pytest.raises(ConflictError, match="Voeg eerst"):
         write_delivery(FakeBook(Instellingen=ws), RECORD, EMPTY_OLD)
     assert ws.updates == []
 
 
-@pytest.mark.parametrize("over", [{"amount": -1}, {"amount": None}, {"supplier": ""}, {"slot": ""}, {"source": ""},
+@pytest.mark.parametrize("over", [{"amount": -1}, {"amount": None}, {"supplier": ""}, {"basket": None},
+                                  {"basket": -1}, {"source": ""},
                                   {"date": None}, {"verified": date(2026, 11, 7)}])
 def test_delivery_rejects_invalid_input(over):
     ws = FakeSheet(INSTELLINGEN)

@@ -16,8 +16,8 @@ DELIVERY_DAY = date(2026, 11, 6)
 
 def settings(**over):
     values = {"Weekbudget": 150, "Werkelijke bezorgkosten": 0, "Bezorgkosten gecontroleerd op": "2026-11-05",
-              "Bezorging leverancier": "Jumbo", "Bezorgdatum": "2026-11-06", "Bezorgmoment": "18:00-20:00",
-              "Bezorgkosten bron": "checkout-scherm"}
+              "Bezorging leverancier": "Jumbo", "Bezorgdatum": "2026-11-06",
+              "Bezorgkosten bron": "checkout-scherm", "Mandtotaal checkout": 6.25}
     values.update(over)
     return settings_map([["Instelling", "Waarde"]] + [[k, v] for k, v in values.items()])
 
@@ -157,7 +157,21 @@ def test_confirmations_write_even_unchanged_counts():
 
 def test_verified_free_delivery_gives_go():
     spend, (go, reasons) = evaluate()
-    assert go is True and spend["grand_total"] == 6.25 and "€0,00" in reasons[0]
+    assert go is True and spend["grand_total"] == 6.25 and "checkout €6.25 + €0.00 bezorging" in reasons[0]
+    assert spend["expected_total"] == 6.25 and spend["lines"][0]["opmerking"] == "verwacht (bevestigd)"
+
+
+@pytest.mark.parametrize("basket,go_expected", [("", False), ("abc", False), (-1, False), (0, True), ("€ 143,75", True)])
+def test_go_needs_checkout_basket_total(basket, go_expected):
+    spend, (go, reasons) = evaluate(delivery_settings=settings(**{"Mandtotaal checkout": basket}))
+    assert go is go_expected
+    if not go_expected:
+        assert spend["grand_total"] is None and any("Mandtotaal" in r for r in reasons)
+
+
+def test_slot_is_no_longer_required():
+    spend, (go, _) = evaluate(delivery_settings=settings(Bezorgmoment=""))
+    assert go is True and "slot" not in delivery_check(settings(), TODAY)
 
 
 @pytest.mark.parametrize("amount", [0.01, 4.95, "€ 1,00"])
@@ -172,7 +186,7 @@ def test_paid_delivery_is_no_go(amount):
     {"Bezorgkosten gecontroleerd op": ""},              # unverified €0
     {"Bezorgkosten gecontroleerd op": "2026-11-07"},    # verified after delivery / in the future
     {"Bezorging leverancier": ""},
-    {"Bezorgmoment": ""},
+    {"Mandtotaal checkout": ""},
     {"Bezorgkosten bron": ""},
     {"Werkelijke bezorgkosten": ""},
 ])
@@ -183,24 +197,25 @@ def test_stale_or_incomplete_free_delivery_is_no_go(over):
 
 def test_free_delivery_of_another_supplier_invalidates_prices():
     spend, (go, _) = evaluate(delivery_settings=settings(**{"Bezorging leverancier": "AH"}))
-    assert go is False and spend["invalid_price"] == [("Kaas", "andere leverancier")]
+    assert spend["invalid_price"] == [("Kaas", "andere leverancier")] and spend["expected_total"] is None
+    assert go is True            # GO rests on the AH checkout total, never on another supplier's line prices
 
 
-def test_new_slot_invalidates_normal_price_checked_for_other_date():
+def test_new_date_invalidates_normal_price_checked_for_other_date():
     spend, (go, _) = evaluate(delivery_settings=settings(Bezorgdatum="2026-11-07"))
-    assert go is False and spend["invalid_price"] == [("Kaas", "verlopen")]
+    assert spend["invalid_price"] == [("Kaas", "verlopen")] and spend["expected_total"] is None
 
 
 # --- prices ------------------------------------------------------------------------------------
 
 def test_offer_valid_through_delivery_date():
-    ok = evaluate(rows=[line(kind="Aanbieding", until="2026-11-10")])
-    assert ok[1][0] is True
+    spend = evaluate(rows=[line(kind="Aanbieding", until="2026-11-10")])[0]
+    assert spend["expected_total"] == 6.25 and spend["lines"][0]["opmerking"] == "verwacht (aanbieding)"
 
 
 def test_expired_offer_before_delivery_is_no_go():
     spend, (go, _) = evaluate(rows=[line(kind="Aanbieding", until="2026-11-05")])
-    assert go is False and spend["invalid_price"] == [("Kaas", "verlopen")]
+    assert spend["invalid_price"] == [("Kaas", "verlopen")] and spend["expected_total"] is None
 
 
 @pytest.mark.parametrize("over,status", [
@@ -215,13 +230,13 @@ def test_price_without_proof_is_not_trusted(over, status):
     item = line(**over)
     delivery = dict(delivery_check(settings(), TODAY), today=TODAY)
     assert price_status(item, delivery) == status
-    assert evaluate(rows=[item])[1][0] is False
+    assert evaluate(rows=[item])[0]["expected_total"] is None
 
 
 def test_week_old_price_alone_is_not_enough():
     # checked 7 days before delivery for an earlier date -> too old and not for this delivery day
     spend, (go, _) = evaluate(rows=[line(checked="2026-10-30", until="2026-10-31")])
-    assert go is False and spend["invalid_price"] == [("Kaas", "verouderd")]
+    assert spend["invalid_price"] == [("Kaas", "verouderd")] and spend["expected_total"] is None
 
 
 def test_price_without_delivery_check():
@@ -234,11 +249,12 @@ def test_budget_hard_cap_and_limits():
     assert effective_budget(200) == MAX_BUDGET == 150.0
     assert effective_budget("€ 120,00") == 120.0
     assert effective_budget(None) is None and effective_budget(0) is None and effective_budget(-5) is None
-    rows = [line(wanted=1, price=150.0, pack="1 gram")]
-    assert evaluate(rows=rows, budget=200)[1][0] is True      # exactly 150.00 incl. €0 delivery
-    rows = [line(wanted=1, price=150.01, pack="1 gram")]
-    spend, (go, reasons) = evaluate(rows=rows, budget=200)
+    at = lambda v: settings(**{"Mandtotaal checkout": v})
+    assert evaluate(delivery_settings=at(150.0), budget=200)[1][0] is True      # exactly 150.00 incl. €0 delivery
+    spend, (go, reasons) = evaluate(delivery_settings=at(150.01), budget=200)
     assert go is False and "Budget overschreden" in reasons[0]
+    spend, (go, reasons) = evaluate(delivery_settings=at(120.01), budget="€ 120,00")
+    assert go is False and "€120.01 op €120.00" in reasons[0]
     assert evaluate(budget=None)[1][0] is False
 
 
@@ -279,15 +295,15 @@ def test_duplicate_voorraad_rows_must_all_be_current_and_are_summed():
 def test_unit_change_after_price_save_invalidates_price():
     item = line(unit="kg", pack="500 gram", wanted=1, listed=0)   # price saved as €/gram, row now in kg
     spend, (go, _) = evaluate(rows=[item], inventory=[stock(unit="kg")])
-    assert go is False and spend["invalid_price"] == [("Kaas", "verpakking/eenheid onbekend")]
+    assert spend["invalid_price"] == [("Kaas", "verpakking/eenheid onbekend")] and spend["expected_total"] is None
 
 
 def test_normal_price_must_be_checked_for_exact_delivery_date_in_order_week():
     spend, (go, _) = evaluate(rows=[line(checked="2026-01-05", until="2026-12-31")])
-    assert go is False and spend["invalid_price"] == [("Kaas", "verouderd")]
+    assert spend["invalid_price"] == [("Kaas", "verouderd")]
     spend, (go, _) = evaluate(rows=[line(checked="2026-11-05", until="2026-12-31")])   # normal, but not for 6 Nov
-    assert go is False and spend["invalid_price"] == [("Kaas", "verlopen")]
-    assert evaluate(rows=[line(kind="Aanbieding", checked="2026-11-05", until="2026-12-31")])[1][0] is True
+    assert spend["invalid_price"] == [("Kaas", "verlopen")]
+    assert evaluate(rows=[line(kind="Aanbieding", checked="2026-11-05", until="2026-12-31")])[0]["expected_total"] == 6.25
 
 
 def test_old_delivery_check_is_no_go_even_if_date_moved():
@@ -318,7 +334,7 @@ def test_whole_packs_and_cent_rounding():
     assert line_cost(line(wanted=500, pack="500 gram", price=0.0125)) == 6.25
     assert line_cost(line(wanted=1, pack="1 stuks", unit="stuks", price=75.002)) == 75.0
     spend, (go, _) = evaluate(rows=[line(wanted=750)])
-    assert go is True and spend["grand_total"] == 12.50
+    assert go is True and spend["expected_total"] == 12.50 and spend["grand_total"] == 6.25   # GO = checkout
 
 
 def test_pack_parsing_and_normalisation():
@@ -355,4 +371,4 @@ def test_renamed_weekdoel_column_is_reported():
 
 def settings_rows():
     return [["Instelling", "Waarde"]] + [[k, ""] for k in ("Weekbudget", "Werkelijke bezorgkosten",
-            "Bezorgkosten gecontroleerd op", "Bezorging leverancier", "Bezorgdatum", "Bezorgmoment", "Bezorgkosten bron")]
+            "Bezorgkosten gecontroleerd op", "Bezorging leverancier", "Bezorgdatum", "Bezorgkosten bron")]
