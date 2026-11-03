@@ -1,73 +1,57 @@
-"""drive.file + one-time Google Picker: pick interpretation, gating, token exposure and the pick -> access flow."""
+"""Top-level Picker navigation, protected callback and the stock workflow."""
+
+import base64
+import hashlib
 import sys
+from dataclasses import replace
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
 pytest.importorskip("streamlit")
+from streamlit.testing.v1 import AppTest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tests"))
 import auth  # noqa: E402
 import picker  # noqa: E402
 import sheet_store  # noqa: E402
-from picker import SPREADSHEET_MIME, check_pick  # noqa: E402
-from test_app import fresh_caches, make_book, start  # noqa: E402,F401  (autouse fixture re-used)
+from test_app import count_kaas, fresh_caches, make_book, start  # noqa: E402,F401
 from test_keyless import Secrets, failing_book, shows_no_data  # noqa: E402
 
-PICKER = {"picker": {"api_key": "browser-key-example", "app_id": "123456789012"}}
-TOKEN = "ya29.EXAMPLE-TOKEN-VALUE"
+AUTH = {
+    "client_id": "123456-example.apps.googleusercontent.com",
+    "client_secret": "fixture-client-secret",
+    "cookie_secret": "fixture-cookie-secret" * 3,
+    "redirect_uri": "https://x.streamlit.app/oauth2callback",
+}
+TOKEN = "fixture-original-google-token"
 
 
-def components(at):
-    found = []
-
-    def walk(node):
-        children = getattr(node, "children", None)
-        for ch in (children.values() if isinstance(children, dict) else []):
-            if getattr(ch, "type", "") == "bidi_component":
-                found.append(ch)
-            walk(ch)
-    walk(at._tree)
-    return found
+def configured_picker():
+    return picker.Picker.from_login(AUTH, "fake", TOKEN)
 
 
-# --- interpreting the browser's answer -------------------------------------------------------------------
-
-@pytest.mark.parametrize("picked,status", [
-    ({"id": "sheet-1", "mime": SPREADSHEET_MIME}, "ok"),
-    ({"id": "other-file", "mime": SPREADSHEET_MIME}, "wrong_file"),
-    ({"id": "sheet-1", "mime": "application/pdf"}, "wrong_file"),         # same ID claimed, wrong type
-    ({"id": "sheet-1"}, "wrong_file"),                                      # manipulated/incomplete answer
-    ({"id": " sheet-1", "mime": SPREADSHEET_MIME}, "wrong_file"),          # exact match only
-    ({"cancelled": True}, "cancelled"),
-    ({"error": "load"}, "error"),
-    (None, None), ({}, None), ("sheet-1", None), (["sheet-1"], None),
-])
-def test_pick_answer_is_only_compared_with_the_configured_sheet(picked, status):
-    assert check_pick(picked, "sheet-1")[0] == status
+def request_params(at):
+    url = at.get("link_button")[0].proto.url
+    return parse_qs(urlsplit(url).query)
 
 
-def test_picker_config_requires_key_and_numeric_project_number(monkeypatch):
-    import streamlit as st
-    for cfg, ok in (({"api_key": "k", "app_id": "123"}, True), ({"api_key": "k", "app_id": "my-project"}, False),
-                    ({"api_key": "", "app_id": "123"}, False), ({"app_id": "123"}, False), ({}, False)):
-        monkeypatch.setattr(st, "secrets", Secrets(picker=cfg))
-        assert (auth.picker_config() != (None, None)) is ok
+def test_open_picker_is_top_level_and_has_only_per_file_scope(monkeypatch):
+    at, _ = start(monkeypatch, failing_book(PermissionError("")), token=TOKEN, secrets={"auth": AUTH})
+    link = at.get("link_button")[0].proto
+    url = urlsplit(link.url)
+    params = request_params(at)
+    assert link.label == "Voorraadbestand kiezen" and shows_no_data(at)
+    assert (url.scheme, url.netloc, url.path) == ("https", "accounts.google.com", "/o/oauth2/v2/auth")
+    assert params["scope"] == ["https://www.googleapis.com/auth/drive.file"]
+    assert params["trigger_onepick"] == ["true"] and params["prompt"] == ["consent"]
+    assert params["file_ids"] == ["fake"] and params["redirect_uri"] == ["https://x.streamlit.app/"]
+    assert params["code_challenge_method"] == ["S256"]
+    assert "code_verifier" not in params and "client_secret" not in params
+    assert all(secret not in link.url for secret in (TOKEN, AUTH["client_secret"], AUTH["cookie_secret"]))
 
-
-def test_component_javascript_never_persists_or_logs_the_token():
-    js = picker._JS
-    for forbidden in ("localStorage", "sessionStorage", "document.cookie", "indexedDB", "console.", "history.",
-                      "location.hash", "location.search", "fetch(", "XMLHttpRequest", "postMessage"):
-        assert forbidden not in js, forbidden
-    assert ".setOAuthToken(token)" in js and ".setAppId(data.appId)" in js and ".setDeveloperKey(data.apiKey)" in js
-    assert "return () => { token = null;" in js                             # dropped from memory on unmount
-    assert js.count("button.disabled = false") >= 3                         # retry possible after pick/cancel/error
-    assert '"https://apis.google.com/js/api.js"' in js                    # only Google's official loader
-
-
-# --- gating: the token only reaches the browser after every check passed -----------------------------------
 
 @pytest.mark.parametrize("user,allow", [
     ({"is_logged_in": False}, ("ouder@example.com",)),
@@ -75,117 +59,121 @@ def test_component_javascript_never_persists_or_logs_the_token():
     ({"is_logged_in": True, "email": "ouder@example.com", "email_verified": False}, ("ouder@example.com",)),
     ({"is_logged_in": True, "email": "ouder@example.com", "email_verified": True}, ()),
 ])
-def test_picker_and_token_never_sent_before_authorisation(monkeypatch, user, allow):
-    at, calls = start(monkeypatch, failing_book(PermissionError("")), user=user, allow=allow, token=TOKEN,
-                      secrets=PICKER)
-    assert components(at) == [] and calls == [] and shows_no_data(at)
-    assert not any(TOKEN in str(getattr(e, "value", "")) for e in at.markdown)
+def test_unauthorised_account_cannot_open_picker_or_use_callback(monkeypatch, user, allow):
+    def unexpected_request(*args, **kwargs):
+        pytest.fail("Unauthorised OAuth code exchange")
+
+    monkeypatch.setattr(picker.requests, "post", unexpected_request)
+    at, calls = start(monkeypatch, failing_book(PermissionError("")), user=user, allow=allow,
+                      token=TOKEN, secrets={"auth": AUTH})
+    at.query_params.update(callback(configured_picker()))
+    at.run()
+    assert not at.get("link_button") and calls == [] and shows_no_data(at)
 
 
-def test_pick_step_sends_token_and_config_only_to_the_picker_component(monkeypatch):
-    at, calls = start(monkeypatch, failing_book(PermissionError("")), token=TOKEN, secrets=PICKER)
-    comps = components(at)
-    assert len(comps) == 1 and shows_no_data(at)
-    proto = str(comps[0].proto)
-    assert TOKEN in proto and "browser-key-example" in proto and "123456789012" in proto
-    assert '\\"fileId\\": \\"fake\\"' in proto or '"fileId": "fake"' in proto   # restricted to the configured Sheet
-    texts = [str(getattr(e, "value", "")) for kind in ("markdown", "caption", "error", "warning", "subheader")
-             for e in getattr(at, kind)]
-    assert not any(TOKEN in t for t in texts)                                # never as visible text
-
-
-def test_pick_step_without_picker_config_fails_closed(monkeypatch):
+def test_missing_oauth_config_fails_closed(monkeypatch):
     at, _ = start(monkeypatch, failing_book(PermissionError("")), token=TOKEN)
-    assert components(at) == [] and any("niet ingericht" in e.value for e in at.error) and shows_no_data(at)
+    assert not at.get("link_button") and any("niet ingericht" in e.value for e in at.error)
 
 
-def test_wrong_scope_token_is_not_offered_the_picker(monkeypatch):
-    from test_keyless import api_error
-    at, _ = start(monkeypatch, failing_book(api_error(403, "Request had insufficient authentication scopes.")),
-                  token=TOKEN, secrets=PICKER)
-    assert components(at) == [] and any("opnieuw" in b.label for b in at.button) and shows_no_data(at)
+@pytest.mark.parametrize("failure", ["scope", "expired"])
+def test_wrong_scope_or_expired_token_is_not_offered_picker(monkeypatch, failure):
+    from test_keyless import api_error, refresh_error
+    exc = (api_error(403, "Request had insufficient authentication scopes.")
+           if failure == "scope" else refresh_error())
+    at, _ = start(monkeypatch, failing_book(exc), token=TOKEN, secrets={"auth": AUTH})
+    assert not at.get("link_button") and any("opnieuw" in b.label for b in at.button) and shows_no_data(at)
 
 
-def test_expired_token_is_not_offered_the_picker(monkeypatch):
-    from test_keyless import refresh_error
-    at, _ = start(monkeypatch, failing_book(refresh_error()), token=TOKEN, secrets=PICKER)
-    assert components(at) == [] and any("verlopen" in e.value for e in at.error)
+def callback(flow):
+    state = parse_qs(urlsplit(flow.authorization_url("ouder@example.com")).query)["state"]
+    return {"state": state, "code": ["fixture-code"], "picked_file_ids": ["fake"]}
 
 
-# --- pick -> access flow -----------------------------------------------------------------------------------
+@pytest.mark.parametrize("change,expected", [
+    ("missing_state", "invalid"), ("tampered", "invalid"), ("expired", "invalid"),
+    ("wrong_login", "invalid"), ("duplicate_code", "invalid"), ("different_file", "wrong_file"),
+    ("multiple_files", "wrong_file"), ("cancelled", "cancelled"),
+])
+def test_invalid_callback_is_rejected_before_exchange(monkeypatch, change, expected):
+    flow = configured_picker()
+    monkeypatch.setattr(picker.time, "time", lambda: 1000)
+    params = callback(flow)
+    if change == "missing_state":
+        del params["state"]
+    elif change == "tampered":
+        params["state"][0] += "a"
+    elif change == "expired":
+        monkeypatch.setattr(picker.time, "time", lambda: 1601)
+    elif change == "wrong_login":
+        flow = replace(flow, login_token="another-login")
+    elif change == "duplicate_code":
+        params["code"].append("another-code")
+    elif change == "different_file":
+        params["picked_file_ids"] = ["other"]
+    elif change == "multiple_files":
+        params["picked_file_ids"] = ["fake,other"]
+    elif change == "cancelled":
+        params = {"state": params["state"], "error": ["access_denied"]}
 
-def granted_after_pick(monkeypatch):
-    """Simulates Google: no access until the configured Sheet is picked; records which ID the server opens."""
-    state = {"granted": False, "opened": []}
+    def unexpected_request(*args, **kwargs):
+        pytest.fail("Invalid callback triggered an OAuth code exchange")
+
+    monkeypatch.setattr(picker.requests, "post", unexpected_request)
+    assert flow.complete(params) == expected
+
+
+class TokenResponse:
+    status_code = 200
+
+    def json(self):
+        return {"access_token": "fixture-picker-only-token", "scope": auth.FILE_SCOPE}
+
+
+@pytest.mark.parametrize("granted", [True, False])
+def test_callback_checks_actual_sheet_access_and_can_save_stock(monkeypatch, granted):
     book = make_book()
+    at, _ = start(monkeypatch, failing_book(PermissionError("")), token=TOKEN, secrets={"auth": AUTH})
+    params = request_params(at)
+    opened = []
+    exchanges = []
 
     def connect(token, sheet_id):
-        state["opened"].append(sheet_id)
-        if not state["granted"]:
+        opened.append((token, sheet_id))
+        if not exchanges or not granted:
             raise PermissionError("")
         return book
-    return state, connect
 
+    def exchange(url, *, data, timeout, allow_redirects):
+        assert url == "https://oauth2.googleapis.com/token" and not allow_redirects and timeout > 0
+        assert data["redirect_uri"] == params["redirect_uri"][0]
+        assert data["client_secret"] == AUTH["client_secret"] and data["code"] == "fixture-code"
+        challenge = hashlib.sha256(data["code_verifier"].encode()).digest()
+        assert base64.urlsafe_b64encode(challenge).decode().rstrip("=") == params["code_challenge"][0]
+        exchanges.append(url)
+        return TokenResponse()
 
-def test_picking_the_configured_sheet_grants_access_and_shows_dashboard(monkeypatch):
-    state, connect = granted_after_pick(monkeypatch)
-    at, _ = start(monkeypatch, make_book(), token=TOKEN, secrets=PICKER)   # warm start replaced below
-    import streamlit as st
-    st.cache_data.clear()
-    st.cache_resource.clear()
     monkeypatch.setattr(sheet_store, "connect", connect)
-    answers = iter([{"id": "fake", "mime": SPREADSHEET_MIME}])
-
-    def picker_step(token, api_key, app_id, sheet_id, key="voorraad_picker"):
-        assert token == TOKEN and sheet_id == "fake" and app_id == "123456789012"
-        picked = next(answers, None)
-        if picked:
-            state["granted"] = True                                         # Google records the drive.file grant
-        return picked
-    monkeypatch.setattr(picker, "picker_step", picker_step)
+    monkeypatch.setattr(picker.requests, "post", exchange)
+    # A return in a new tab has the login cookie but a fresh Streamlit session.
+    returned = AppTest.from_file(str(ROOT / "app.py"), default_timeout=30)
+    returned.secrets.update(at.secrets)
+    at = returned
+    at.query_params.update({"state": params["state"], "code": ["fixture-code"], "picked_file_ids": ["fake"]})
     at.run()
-    assert len(at.tabs) == 7 and not components(at)
-    assert set(state["opened"]) == {"fake"}                                 # only SHEET_ID is ever opened
+    assert not at.exception and not at.query_params and len(exchanges) == 1
+    if granted:
+        assert len(at.tabs) == 7 and not at.get("link_button")
+        count_kaas(at, 0.0)
+        assert book.tabs["Voorraad"].grid[2][3] == 0.0
+        assert set(book.tabs["Voorraad"].writes) == {"D3", "G3", "H3", "I3"}
+        assert book.tabs["Voorraad"].formulas[(3, 10)] == '=IF(A3="";"";"x")'
+    else:
+        assert shows_no_data(at) and any("nog geen toegang" in w.value for w in at.warning)
+        assert not book.tabs["Voorraad"].writes
+        at.run()
+    assert set(opened) == {(TOKEN, "fake")} and len(exchanges) == 1
 
-
-def test_picking_another_file_gives_no_access_and_is_never_opened(monkeypatch):
-    state, connect = granted_after_pick(monkeypatch)
-    monkeypatch.setattr(sheet_store, "connect", connect)
-
-    def picker_step(token, api_key, app_id, sheet_id, key="voorraad_picker"):
-        return {"id": "someone-elses-file", "mime": SPREADSHEET_MIME}
-    monkeypatch.setattr(picker, "picker_step", picker_step)
-    at, _ = start(monkeypatch, make_book(), token=TOKEN, secrets=PICKER)
-    monkeypatch.setattr(sheet_store, "connect", connect)
-    import streamlit as st
-    st.cache_data.clear()
-    st.cache_resource.clear()
-    at.run()
-    assert any("niet het ingestelde voorraadbestand" in w.value for w in at.warning) and shows_no_data(at)
-    assert "someone-elses-file" not in state["opened"]
-
-
-def test_pick_without_resulting_access_explains_instead_of_looping(monkeypatch):
-    calls = {"n": 0}
-
-    def never_granted(token, sheet_id):
-        calls["n"] += 1
-        raise PermissionError("")
-
-    def picker_step(token, api_key, app_id, sheet_id, key="voorraad_picker"):
-        return {"id": "fake", "mime": SPREADSHEET_MIME} if calls["n"] <= 1 else None
-    monkeypatch.setattr(picker, "picker_step", picker_step)
-    at, _ = start(monkeypatch, make_book(), token=TOKEN, secrets=PICKER)
-    monkeypatch.setattr(sheet_store, "connect", never_granted)
-    import streamlit as st
-    st.cache_data.clear()
-    st.cache_resource.clear()
-    at.run()
-    assert any("nog geen toegang" in w.value for w in at.warning) and shows_no_data(at)
-    assert calls["n"] <= 3                                                   # one rerun after the pick, no loop
-
-
-# --- review M1 / m1 regressions ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("scope,ok", [
     ("openid email profile https://www.googleapis.com/auth/drive.file", True),
@@ -204,34 +192,6 @@ def test_scopes_must_be_exactly_login_plus_drive_file(monkeypatch, scope, ok):
            "expose_tokens": "access", "client_kwargs": {"scope": scope}}
     monkeypatch.setattr(st, "secrets", Secrets(auth=cfg))
     assert auth.login_configured() is ok
-
-
-def test_project_number_must_be_ascii_digits(monkeypatch):
-    import streamlit as st
-    monkeypatch.setattr(st, "secrets", Secrets(picker={"api_key": "k", "app_id": "１２３"}))   # full-width digits
-    assert auth.picker_config() == (None, None)
-
-
-def test_wrong_pick_message_is_honest_about_the_google_grant():
-    status, message = check_pick({"id": "other", "mime": SPREADSHEET_MIME}, "sheet-1")
-    assert status == "wrong_file" and "gebruikt dat bestand niet" in message and "permissions" in message
-
-
-def test_project_number_is_derived_from_the_oauth_client_id(monkeypatch):
-    import streamlit as st
-    cases = [
-        ({"picker": {"api_key": "k"}, "auth": {"client_id": "123456789012-abc123.apps.googleusercontent.com"}},
-         ("k", "123456789012")),
-        ({"picker": {"api_key": "k", "app_id": "999"}, "auth": {"client_id": "123-abc.apps.googleusercontent.com"}},
-         ("k", "999")),                                                     # explicit app_id wins
-        ({"picker": {"api_key": "k"}, "auth": {"client_id": "not-a-number.apps.googleusercontent.com"}},
-         (None, None)),
-        ({"picker": {"api_key": "k"}, "auth": {"client_id": "nodash"}}, (None, None)),
-        ({"picker": {}, "auth": {"client_id": "123-abc.apps.googleusercontent.com"}}, (None, None)),  # no key
-    ]
-    for secrets, expected in cases:
-        monkeypatch.setattr(st, "secrets", Secrets(**secrets))
-        assert auth.picker_config() == expected
 
 
 def test_login_problems_name_what_is_missing_without_values(monkeypatch):
@@ -255,7 +215,6 @@ def test_not_configured_page_lists_problems_and_reads_nothing(monkeypatch):
     calls = []
     monkeypatch.setattr(sheet_store, "connect", lambda *a: calls.append(a))
     monkeypatch.setattr(auth, "current_user", lambda: {"is_logged_in": False})
-    from streamlit.testing.v1 import AppTest
     at = AppTest.from_file(str(ROOT / "app.py"), default_timeout=30)
     at.secrets["auth"] = {"redirect_uri": "https://x.streamlit.app/oauth2callback", "client_id": "1-a",
                           "cookie_secret": "z" * 40,
